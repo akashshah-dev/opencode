@@ -12,6 +12,7 @@ export interface CreateWebSocketFetchOptions {
   idleTimeout?: number
   maxConnectionAge?: number
   streamRetries?: number
+  proxy?: (sessionID: string | undefined) => string | undefined
 }
 
 interface PoolEntry {
@@ -89,6 +90,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         connectTimeout,
         maxConnectionAge,
         init?.signal,
+        options?.proxy?.(sessionID),
       )
       let resolveFirstEvent: (event: boolean | OpenAIWebSocket.WrappedError) => void = () => {}
       let rejectFirstEvent: (error: Error) => void = () => {}
@@ -221,6 +223,7 @@ async function socket(
   connectTimeout: number,
   maxConnectionAge: number,
   signal?: AbortSignal | null,
+  proxy?: string,
 ) {
   if (
     entry.socket?.readyState === WebSocket.OPEN &&
@@ -236,6 +239,7 @@ async function socket(
     headers,
     timeout: connectTimeout,
     signal: signal ?? undefined,
+    proxy,
   })
   entry.connectedAt = Date.now()
   return next

@@ -54,6 +54,7 @@ export class HttpOptions extends Schema.Class<HttpOptions>("LLM.HttpOptions")({
   body: Schema.optional(JsonSchema),
   headers: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   query: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+  proxy: Schema.optional(Schema.String),
 }) {}
 
 export namespace HttpOptions {
@@ -67,8 +68,9 @@ export const mergeHttpOptions = (...items: ReadonlyArray<HttpOptions | undefined
   const body = mergeJsonRecords(...items.map((item) => item?.body))
   const headers = mergeStringRecords(...items.map((item) => item?.headers))
   const query = mergeStringRecords(...items.map((item) => item?.query))
-  if (!body && !headers && !query) return undefined
-  return new HttpOptions({ body, headers, query })
+  const proxy = items.findLast((item) => item?.proxy !== undefined)?.proxy
+  if (!body && !headers && !query && !proxy) return undefined
+  return new HttpOptions({ body, headers, query, proxy })
 }
 
 export class GenerationOptions extends Schema.Class<GenerationOptions>("LLM.GenerationOptions")({

@@ -16,6 +16,7 @@ export interface ConnectResponsesWebSocketOptions {
   headers: Record<string, string>
   timeout?: number
   signal?: AbortSignal
+  proxy?: string
 }
 
 export interface StreamResponsesWebSocketOptions {
@@ -69,6 +70,16 @@ export function isAbortError(error: unknown): error is DOMException {
   return error instanceof DOMException && error.name === "AbortError"
 }
 
+export function connectWithProxyAuth(headers: Record<string, string>, proxy: string | undefined) {
+  if (!proxy || !URL.canParse(proxy)) return { headers, ...(proxy ? { proxy } : {}) }
+  const parsed = new URL(proxy)
+  if (!parsed.username && !parsed.password) return { headers, proxy }
+  const auth = `Basic ${Buffer.from(`${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`).toString("base64")}`
+  parsed.username = ""
+  parsed.password = ""
+  return { headers: { ...headers, "proxy-authorization": auth }, proxy: parsed.toString() }
+}
+
 export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOptions) {
   return new Promise<WebSocket>((resolve, reject) => {
     if (options.signal?.aborted) {
@@ -83,11 +94,41 @@ export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOpti
     delete headers["content-length"]
 
     // Bun does not apply HTTP(S)_PROXY to WebSockets unless the proxy is supplied explicitly.
+    // An explicit session proxy wins over the environment. The ws client only
+    // tunnels CONNECT through http(s) proxies, so an explicit SOCKS session
+    // proxy rejects here — a session pinned to SOCKS must not silently route
+    // direct or via an HTTP env proxy while the HTTP path uses SOCKS.
+    // Parse the scheme case-insensitively so SOCKS5:// or padded values can't
+    // slip through to the CONNECT path. Trim once and reuse the trimmed value
+    // so a padded proxy never reaches the dial with whitespace intact.
+    const trimmedProxy = options.proxy?.trim() || undefined
+    const proxyScheme = (() => {
+      const value = trimmedProxy ?? ""
+      const separator = value.indexOf("://")
+      if (separator === -1) return value.toLowerCase()
+      return value.slice(0, separator).toLowerCase()
+    })()
+    const explicitSocks = trimmedProxy && proxyScheme.startsWith("socks") ? trimmedProxy : undefined
+    // The ws client cannot tunnel SOCKS. Failing closed here: falling back to
+    // direct would silently bypass the session proxy while the HTTP path uses
+    // it, and falling back to env could route via an unrelated HTTP proxy.
+    if (explicitSocks) {
+      reject(
+        new Error(
+          `Session SOCKS proxy "${explicitSocks}" is not supported for WebSockets; use an HTTP(S) proxy or direct.`,
+        ),
+      )
+      return
+    }
+    const explicit = trimmedProxy
     const proxy =
-      typeof Bun === "undefined"
+      explicit ??
+      (typeof Bun === "undefined"
         ? undefined
-        : ProxyEnv.getProxyForUrl(options.url.replace(/^wss:/, "https:").replace(/^ws:/, "http:"))
-    const connect = { headers, ...(proxy ? { proxy } : {}) }
+        : ProxyEnv.getProxyForUrl(options.url.replace(/^wss:/, "https:").replace(/^ws:/, "http:")))
+    // The ws package tunnels CONNECT itself; strip userinfo into an explicit
+    // Proxy-Authorization header so credentials are always forwarded.
+    const connect = connectWithProxyAuth(headers, proxy)
     const socket = new WebSocket(options.url, connect)
     const timeout = options.timeout
       ? setTimeout(() => {

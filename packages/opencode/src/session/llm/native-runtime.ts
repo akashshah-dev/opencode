@@ -17,6 +17,8 @@ import {
   type LLMEvent,
 } from "@opencode-ai/llm"
 import type { LLMClientShape } from "@opencode-ai/llm/route"
+import type { ProxyFetch } from "@/proxy/fetch"
+import { Proxy as SessionProxy } from "@/proxy/proxy"
 import { LLMNative } from "./native-request"
 
 export type RuntimeStatus =
@@ -31,6 +33,10 @@ type StreamInput = {
   readonly provider: Provider.Info
   readonly auth: Auth.Info | undefined
   readonly llmClient: LLMClientShape
+  // Carried as a selection (not a resolved URL) so resolution happens below
+  // against the real request target, matching the AI-SDK path which
+  // re-resolves per request URL inside ProxyFetch.
+  readonly proxy?: ProxyFetch.Selection
   readonly messages: ModelMessage[]
   readonly tools: Record<string, Tool>
   readonly toolChoice?: "auto" | "required" | "none"
@@ -86,11 +92,28 @@ export function stream(input: StreamInput): StreamResult {
   // OpenAI's official wire field names, so this is identity, not translation
   // — if a field ever needs to differ between the two surfaces, the
   // translation belongs here, not split across both packages.
+  // Resolve the session proxy selection against the actual request target
+  // (the baseURL baked into the request below). Resolving once upstream
+  // against a different host would bypass per-host entry noProxy rules for
+  // requests here. Misconfiguration (unknown/disabled ids, missing
+  // passwordEnv) fails the stream instead of silently going direct.
+  let proxy: string | undefined
+  try {
+    const resolved = SessionProxy.resolveForSession({
+      proxyID: input.proxy?.proxyID,
+      proxy: input.proxy?.config,
+      url: current.baseURL ?? input.model.api.url,
+    })
+    proxy = resolved.kind === "direct" ? undefined : resolved.url
+  } catch (cause) {
+    return { ...current, stream: Stream.fail(cause) }
+  }
   const tools = nativeTools(input.tools, input)
   const request = LLMNative.request({
     model: input.model,
     apiKey: current.apiKey,
     baseURL: current.baseURL,
+    proxy,
     messages: ProviderTransform.message(input.messages, input.model, input.providerOptions ?? {}),
     toolChoice: input.toolChoice,
     temperature: input.temperature,
@@ -99,6 +122,14 @@ export function stream(input: StreamInput): StreamResult {
     maxOutputTokens: input.maxOutputTokens,
     providerOptions: ProviderTransform.providerOptions(input.model, input.providerOptions ?? {}),
     headers: { ...providerHeaders(input.provider.options.headers), ...input.headers },
+  })
+  // Abort wiring: cancelled LLM requests must interrupt proxy sockets
+  // instead of hanging until the proxy times out. The executor honors Effect
+  // interruption for all socket work, so interrupting this stream destroys
+  // in-flight proxy/TLS sockets via its ensuring clauses.
+  const abort: Effect.Effect<void> = Effect.callback<void>((resume) => {
+    if (input.abort.aborted) resume(Effect.void)
+    else input.abort.addEventListener("abort", () => resume(Effect.void), { once: true })
   })
   const stream = Stream.scoped(
     Stream.unwrap(
@@ -134,7 +165,7 @@ export function stream(input: StreamInput): StreamResult {
               ),
             ),
           )
-        return provider.pipe(Stream.concat(Stream.fromQueue(results)))
+        return provider.pipe(Stream.concat(Stream.fromQueue(results)), Stream.interruptWhen(abort))
       }),
     ),
   )

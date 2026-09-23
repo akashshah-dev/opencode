@@ -29,6 +29,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { Session } from "./session"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -58,6 +59,20 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/LLM") {}
 
 export const use = serviceUse(Service)
+
+// Reads the session's explicit proxy choice. Resolves to undefined when the
+// Session service is unavailable (tests, agent generation) or the session is
+// gone — the resolver then falls back to config default / system env.
+const sessionProxyID = Effect.fn("LLM.sessionProxyID")(function* (sessionID: string) {
+  const session = yield* Effect.serviceOption(Session.Service)
+  if (Option.isNone(session)) return undefined as string | undefined
+  return yield* session.value
+    .get(SessionID.make(sessionID))
+    .pipe(
+      Effect.map((info) => info.proxyID),
+      Effect.catch(() => Effect.succeed(undefined as string | undefined)),
+    )
+})
 
 const live: Layer.Layer<
   Service,
@@ -92,9 +107,18 @@ const live: Layer.Layer<
         mode: input.agent.mode,
       })
 
+      // Per-session proxy selection. Falls back to config default / system
+      // env when the session has no explicit choice or Session is unavailable.
+      // Both runtimes resolve per real target host: the AI SDK path
+      // re-resolves per request inside ProxyFetch, and the native path
+      // resolves from the carried selection against its request baseURL.
+      const [proxyID, proxyConfig] = yield* Effect.all(
+        [sessionProxyID(input.sessionID), config.get().pipe(Effect.map((cfg) => cfg.proxy))],
+        { concurrency: "unbounded" },
+      )
       const [language, cfg, item, info] = yield* Effect.all(
         [
-          provider.getLanguage(input.model),
+          provider.getLanguage(input.model, { proxy: { proxyID, config: proxyConfig } }),
           config.get(),
           provider.getProvider(input.model.providerID),
           auth.get(input.model.providerID),
@@ -229,6 +253,7 @@ const live: Layer.Layer<
           provider: item,
           auth: info,
           llmClient,
+          proxy: { proxyID, config: proxyConfig },
           messages: prepared.messages,
           tools: prepared.tools,
           toolChoice: input.toolChoice,

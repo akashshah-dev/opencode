@@ -33,6 +33,20 @@ describe("plugin.openai.ws", () => {
     socket.terminate()
   })
 
+  test("splits proxy credentials into Proxy-Authorization headers", () => {
+    // Bun's WebSocket ignores the `proxy` connect option, so the session
+    // proxy is forwarded as explicit headers + endpoint instead.
+    expect(OpenAIWebSocket.connectWithProxyAuth({}, undefined)).toEqual({ headers: {} })
+    expect(OpenAIWebSocket.connectWithProxyAuth({ a: "b" }, "http://127.0.0.1:8080/")).toEqual({
+      headers: { a: "b" },
+      proxy: "http://127.0.0.1:8080/",
+    })
+    expect(OpenAIWebSocket.connectWithProxyAuth({}, "http://user:pass@127.0.0.1:8080/")).toEqual({
+      headers: { "proxy-authorization": `Basic ${Buffer.from("user:pass").toString("base64")}` },
+      proxy: "http://127.0.0.1:8080/",
+    })
+  })
+
   test("enforces websocket connect timeout", async () => {
     await using server = await createHangingTcpServer()
 

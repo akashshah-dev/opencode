@@ -81,6 +81,7 @@ Rules:
 - `noProxy` lists hosts that bypass the proxy, same syntax as `NO_PROXY`.
 - Precedence per session: explicit session choice, then config `default`, then system environment, then direct. Unknown or disabled proxies fail fast instead of silently going direct.
 - Loopback targets bypass remote proxies (which could not reach them), but still route through a loopback proxy such as a local forwarder.
+- The OpenAI Codex WebSocket transport tunnels HTTP(S) proxies via CONNECT; sessions pinned to a SOCKS proxy use HTTP(S) for those requests instead (the WS runtime cannot tunnel SOCKS). Proxy credentials are never sent to the origin server.
 
 ---
 

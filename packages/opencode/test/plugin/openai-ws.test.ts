@@ -271,6 +271,69 @@ describe("plugin.openai.ws-pool", () => {
     fetch.close()
   })
 
+  test("reports pooled state per session without prefix overlap", async () => {
+    await using server = await createWebSocketServer((socket) => {
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp" } }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({ url: server.url })
+    const forSession = (id: string) => streamRequest({ "session-id": id })
+
+    expect(fetch.has("session-1")).toBe(false)
+    expect(await (await fetch(server.url, forSession("session-1"))).text()).toContain("data: [DONE]")
+    expect(fetch.has("session-1")).toBe(true)
+    expect(fetch.has("session-10")).toBe(false)
+    fetch.remove("session-1")
+    expect(fetch.has("session-1")).toBe(false)
+    fetch.close()
+  })
+
+  test("removes only the exact session despite key prefix overlap", async () => {
+    let websocketAttempts = 0
+    await using server = await createRejectingWebSocketServer(() => websocketAttempts++)
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      connectTimeout: 100,
+      streamRetries: 0,
+    })
+    const forSession = (id: string) => streamRequest({ "session-id": id })
+
+    // Both sessions fail over to HTTP (one WS attempt each).
+    expect(await (await fetch(server.url, forSession("sess"))).text()).toBe("http")
+    expect(await (await fetch(server.url, forSession("sess:x"))).text()).toBe("http")
+    expect(websocketAttempts).toBe(2)
+
+    // Removing "sess" must not evict "sess:x": its fallback entry survives,
+    // so no new dial happens for it — while "sess" re-dials once.
+    fetch.remove("sess")
+    expect(await (await fetch(server.url, forSession("sess:x"))).text()).toBe("http")
+    expect(websocketAttempts).toBe(2)
+    expect(await (await fetch(server.url, forSession("sess"))).text()).toBe("http")
+    expect(websocketAttempts).toBe(3)
+    fetch.close()
+  })
+
+  test("falls back to HTTP when the proxy target is unusable", async () => {
+    let websocketAttempts = 0
+    await using server = await createRejectingWebSocketServer(() => websocketAttempts++)
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      connectTimeout: 100,
+      httpFetch: (async () => new Response("http-direct")) as unknown as typeof globalThis.fetch,
+      proxy: () => {
+        throw new OpenAIWebSocket.InvalidProxyTargetError()
+      },
+    })
+
+    // Misconfiguration still fails fast elsewhere; only garbage targets take
+    // the legacy path — served here without ever dialing.
+    const response = await fetch(server.url, streamRequest())
+    expect(await response.text()).toBe("http-direct")
+    expect(websocketAttempts).toBe(0)
+    fetch.close()
+  })
+
   test("falls back immediately to HTTP when a websocket request is too large", async () => {
     let connections = 0
     await using server = await createWebSocketServer((socket) => {
@@ -336,6 +399,54 @@ describe("plugin.openai.ws-pool", () => {
 
     expect(await second.text()).toContain("data: [DONE]")
     expect(connections).toBe(2)
+    fetch.close()
+  })
+
+  test("tunnels explicit HTTP proxies without leaking credentials to the origin", async () => {
+    let originProxyAuth: unknown
+    await using server = await createWebSocketServer((socket, request) => {
+      originProxyAuth = request.headers["proxy-authorization"]
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_proxied" } }))
+      })
+    })
+    await using proxy = await createForwardProxy({ username: "bot", password: "s3cret" })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      proxy: () => `http://bot:s3cret@127.0.0.1:${new URL(proxy.url).port}`,
+    })
+
+    const response = await fetch(server.url, streamRequest())
+    expect(await response.text()).toContain("data: [DONE]")
+    // Auth traveled on the CONNECT leg…
+    expect(proxy.hits).toHaveLength(1)
+    expect(proxy.hits[0]!.requestLine).toMatch(/^CONNECT 127\.0\.0\.1:\d+ HTTP\/1\.1$/)
+    expect(proxy.hits[0]!.proxyAuthorization).toBe(`Basic ${Buffer.from("bot:s3cret").toString("base64")}`)
+    // …and never reached the origin upgrade.
+    expect(originProxyAuth).toBeUndefined()
+    fetch.close()
+  })
+
+  test("falls back to HTTP immediately for SOCKS-pinned sessions", async () => {
+    let connections = 0
+    await using server = await createWebSocketServer((socket) => {
+      connections += 1
+      socket.once("message", () => {
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_direct" } }))
+      })
+    })
+    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+      url: server.url,
+      proxy: () => "socks5h://127.0.0.1:1080",
+    })
+
+    // No WS dial is attempted; the first request already serves HTTP.
+    const first = await fetch(server.url, streamRequest())
+    expect(await first.text()).toBe("http")
+    const second = await fetch(server.url, streamRequest())
+    expect(await second.text()).toBe("http")
+    expect(connections).toBe(0)
+    expect(server.httpRequests).toHaveLength(2)
     fetch.close()
   })
 
@@ -896,6 +1007,66 @@ async function createRejectingWebSocketServer(onAttempt: () => void) {
     },
   })
   return websocketServerHandle(server, http)
+}
+
+interface ConnectHit {
+  requestLine: string
+  proxyAuthorization: string | undefined
+}
+
+// Minimal plaintext CONNECT forward proxy. Optionally enforces basic auth;
+// records every CONNECT request line plus its Proxy-Authorization header.
+async function createForwardProxy(options?: { username?: string; password?: string }) {
+  const hits: ConnectHit[] = []
+  const sockets = new Set<Socket>()
+  const server = net.createServer((client) => {
+    sockets.add(client)
+    client.on("close", () => sockets.delete(client))
+    let head = Buffer.alloc(0)
+    const onData = (chunk: Buffer) => {
+      head = Buffer.concat([head, chunk])
+      const end = head.indexOf("\r\n\r\n")
+      if (end === -1) return
+      client.off("data", onData)
+      const lines = head.subarray(0, end).toString().split("\r\n")
+      const requestLine = lines[0] ?? ""
+      const proxyAuthorization = lines
+        .find((line) => line.toLowerCase().startsWith("proxy-authorization:"))
+        ?.slice("proxy-authorization:".length)
+        .trim()
+      hits.push({ requestLine, proxyAuthorization })
+      if (options?.username) {
+        const expected = `Basic ${Buffer.from(`${options.username}:${options.password}`).toString("base64")}`
+        if (proxyAuthorization !== expected) {
+          client.write("HTTP/1.1 407 Proxy Auth Required\r\nProxy-Authenticate: Basic\r\n\r\n")
+          client.destroy()
+          return
+        }
+      }
+      const match = /^CONNECT ([^:]+):(\d+) /.exec(requestLine)
+      if (!match) {
+        client.destroy()
+        return
+      }
+      const upstream = net.connect({ host: match[1]!, port: Number(match[2]!) })
+      upstream.once("connect", () => {
+        client.write("HTTP/1.1 200 Connection established\r\n\r\n")
+        client.pipe(upstream).pipe(client)
+      })
+      upstream.once("error", () => client.destroy())
+    }
+    client.on("data", onData)
+  })
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const address = server.address() as AddressInfo
+  return {
+    hits,
+    url: `http://127.0.0.1:${address.port}`,
+    async [Symbol.asyncDispose]() {
+      for (const socket of sockets) socket.destroy()
+      server.close()
+    },
+  }
 }
 
 async function createHttpServer() {

@@ -25,6 +25,7 @@ import { EffectPromise } from "@/effect/promise"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { isRecord } from "@/util/record"
 import { optional } from "@opencode-ai/core/schema"
+import { ProxyFetch } from "@/proxy/fetch"
 import { ProviderTransform } from "./transform"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -1196,7 +1197,10 @@ export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
   readonly getModel: (providerID: ProviderV2.ID, modelID: ModelV2.ID) => Effect.Effect<Model, ModelNotFoundError>
-  readonly getLanguage: (model: Model) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
+  readonly getLanguage: (
+    model: Model,
+    options?: { proxy?: ProxyFetch.Selection },
+  ) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
   readonly closest: (
     providerID: ProviderV2.ID,
     query: string[],
@@ -1212,6 +1216,7 @@ interface State {
   sdk: Map<string, BundledSDK>
   modelLoaders: Record<string, CustomModelLoader>
   varsLoaders: Record<string, CustomVarsLoader>
+  proxyPool: ProxyFetch.Pool
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Provider") {}
@@ -1725,13 +1730,19 @@ const layer = Layer.effect(
           sdk,
           modelLoaders,
           varsLoaders,
+          proxyPool: ProxyFetch.createPool(),
         }
       }),
     )
 
     const list = Effect.fn("Provider.list")(() => InstanceState.use(state, (s) => s.providers))
 
-    async function resolveSDK(model: Model, s: State, envs: Record<string, string | undefined>) {
+    async function resolveSDK(
+      model: Model,
+      s: State,
+      envs: Record<string, string | undefined>,
+      proxy: ProxyFetch.Selection,
+    ) {
       try {
         const provider = s.providers[model.providerID]
         const options = { ...provider.options }
@@ -1790,6 +1801,7 @@ const layer = Layer.effect(
             providerID: model.providerID,
             npm: model.api.npm,
             options,
+            proxy: ProxyFetch.key(proxy),
           }),
         )
         const existing = s.sdk.get(key)
@@ -1802,7 +1814,6 @@ const layer = Layer.effect(
         delete options["headerTimeout"]
 
         options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
-          const fetchFn = customFetch ?? fetch
           const opts = init ?? {}
           const chunkAbortCtl = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
           const headerTimeoutMs = headerTimeout === false ? undefined : headerTimeout
@@ -1818,11 +1829,17 @@ const layer = Layer.effect(
           const combined = signals.length === 0 ? null : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
           if (combined) opts.signal = combined
 
-          const res = await fetchFn(input, {
-            ...opts,
-            // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
-            timeout: false,
-          }).finally(() => headerTimeoutCtl?.clear())
+          // Per-session proxy routing. Direct resolutions fall through to the
+          // existing fetch path unchanged; routed requests use a pooled
+          // dispatcher. Provider-specific fetch transforms (e.g. snowflake)
+          // are bypassed while a session proxy routes the request.
+          const proxied = ProxyFetch.fetch(s.proxyPool, proxy, input, opts)
+          const res = await (proxied ??
+            (customFetch ?? fetch)(input, {
+              ...opts,
+              // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
+              timeout: false,
+            })).finally(() => headerTimeoutCtl?.clear())
 
           if (!chunkAbortCtl) return res
           return wrapSSE(res, chunkTimeout, chunkAbortCtl)
@@ -1893,16 +1910,19 @@ const layer = Layer.effect(
       return info
     })
 
-    const getLanguage = Effect.fn("Provider.getLanguage")(function* (model: Model) {
+    const getLanguage = Effect.fn("Provider.getLanguage")(function* (model: Model, options?: {
+      proxy?: ProxyFetch.Selection
+    }) {
       const s = yield* InstanceState.get(state)
       const envs = yield* env.all()
-      const key = `${model.providerID}/${model.id}`
+      const proxy = options?.proxy ?? {}
+      const key = `${model.providerID}/${model.id}/${ProxyFetch.key(proxy)}`
       if (s.models.has(key)) return s.models.get(key)!
 
       const provider = s.providers[model.providerID]
       return yield* EffectPromise.refineRejection(
         async () => {
-          const sdk = await resolveSDK(model, s, envs)
+          const sdk = await resolveSDK(model, s, envs, proxy)
           const language = s.modelLoaders[model.providerID]
             ? await s.modelLoaders[model.providerID](
                 sdk,

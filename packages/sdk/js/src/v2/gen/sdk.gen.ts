@@ -3414,6 +3414,7 @@ export class Session2 extends HeyApiClient {
       parentID?: string
       title?: string
       agent?: string
+      proxyID?: string
       model?: {
         id: string
         providerID: string
@@ -3437,6 +3438,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "parentID" },
             { in: "body", key: "title" },
             { in: "body", key: "agent" },
+            { in: "body", key: "proxyID" },
             { in: "body", key: "model" },
             { in: "body", key: "metadata" },
             { in: "body", key: "permission" },
@@ -3566,6 +3568,7 @@ export class Session2 extends HeyApiClient {
         [key: string]: unknown
       }
       permission?: PermissionRuleset
+      proxyID?: string
       time?: {
         archived?: number
       }
@@ -3583,6 +3586,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "title" },
             { in: "body", key: "metadata" },
             { in: "body", key: "permission" },
+            { in: "body", key: "proxyID" },
             { in: "body", key: "time" },
           ],
         },

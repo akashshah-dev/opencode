@@ -18,6 +18,7 @@ export function fromRow(row: typeof SessionTable.$inferSelect): SessionSchema.In
     title: row.title,
     parentID: row.parent_id ? SessionSchema.ID.make(row.parent_id) : undefined,
     agent: row.agent ? AgentV2.ID.make(row.agent) : undefined,
+    proxyID: row.proxy_id ?? undefined,
     model: row.model
       ? {
           id: ModelV2.ID.make(row.model.id),

@@ -196,6 +196,7 @@ export type Session = {
   }
   title: string
   agent?: string
+  proxyID?: string
   model?: {
     id: string
     providerID: string
@@ -2251,6 +2252,7 @@ export type GlobalSession = {
   }
   title: string
   agent?: string
+  proxyID?: string
   model?: {
     id: string
     providerID: string
@@ -3937,6 +3939,7 @@ export type SessionV2Info = {
   parentID?: string
   projectID: string
   agent?: string
+  proxyID?: string
   model?: ModelRef
   cost: number
   tokens: {
@@ -9505,6 +9508,7 @@ export type SessionCreateData = {
     parentID?: string
     title?: string
     agent?: string
+    proxyID?: string
     model?: {
       id: string
       providerID: string
@@ -9647,6 +9651,7 @@ export type SessionUpdateData = {
       [key: string]: unknown
     }
     permission?: PermissionRuleset
+    proxyID?: string
     time?: {
       archived?: number
     }

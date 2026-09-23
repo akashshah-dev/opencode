@@ -49,6 +49,7 @@ export const SessionTable = sqliteTable(
     revert: text({ mode: "json" }).$type<Revert.State>(),
     permission: text({ mode: "json" }).$type<PermissionV1.Ruleset>(),
     agent: text(),
+    proxy_id: text(),
     model: text({ mode: "json" }).$type<{
       id: string
       providerID: string

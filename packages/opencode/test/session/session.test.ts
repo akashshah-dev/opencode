@@ -282,4 +282,36 @@ describe("Session", () => {
       expect(saved.metadata).toBeUndefined()
     }),
   )
+
+  it.instance("persists proxyID, updates it, and copies it on fork", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const created = yield* Effect.acquireRelease(session.create({ title: "with-proxy", proxyID: "corp" }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      expect(created.proxyID).toBe("corp")
+      expect((yield* session.get(created.id)).proxyID).toBe("corp")
+
+      yield* session.setProxy({ sessionID: created.id, proxyID: "backup" })
+      expect((yield* session.get(created.id)).proxyID).toBe("backup")
+
+      const fork = yield* Effect.acquireRelease(session.fork({ sessionID: created.id }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      expect(fork.proxyID).toBe("backup")
+    }),
+  )
+
+  it.instance("omits proxyID when not provided", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const created = yield* Effect.acquireRelease(session.create({ title: "no-proxy" }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const saved = yield* session.get(created.id)
+
+      expect(created.proxyID).toBeUndefined()
+      expect(saved.proxyID).toBeUndefined()
+    }),
+  )
 })

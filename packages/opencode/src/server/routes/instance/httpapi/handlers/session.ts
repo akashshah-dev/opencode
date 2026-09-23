@@ -200,6 +200,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       if (ctx.payload.time?.archived !== undefined) {
         yield* session.setArchived({ sessionID: ctx.params.sessionID, time: ctx.payload.time.archived })
       }
+      if (ctx.payload.proxyID !== undefined) {
+        yield* session.setProxy({ sessionID: ctx.params.sessionID, proxyID: ctx.payload.proxyID })
+      }
       return yield* requireSession(ctx.params.sessionID)
     })
 

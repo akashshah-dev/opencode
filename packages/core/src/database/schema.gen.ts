@@ -204,6 +204,7 @@ export default {
           \`revert\` text,
           \`permission\` text,
           \`agent\` text,
+          \`proxy_id\` text,
           \`model\` text,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,

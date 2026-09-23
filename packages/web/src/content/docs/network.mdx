@@ -46,6 +46,45 @@ For proxies requiring advanced authentication like NTLM or Kerberos, consider us
 
 ---
 
+### Per-session proxies
+
+Each session can route through its own proxy, switched from the command palette (`/proxies`) or the `proxy.list` command. Proxy definitions live in `opencode.json`:
+
+```json
+{
+  "proxy": {
+    "default": "corp",
+    "proxies": {
+      "corp": {
+        "name": "Corp",
+        "type": "http",
+        "url": "proxy.corp:8080",
+        "username": "bot",
+        "passwordEnv": "PROXY_PASS",
+        "noProxy": ["internal.corp"]
+      },
+      "tunnel": {
+        "name": "Tunnel",
+        "type": "socks5h",
+        "url": "socks5h://127.0.0.2:1080"
+      }
+    }
+  }
+}
+```
+
+Rules:
+
+- `type` is `http`, `https`, `socks4`, `socks5`, or `socks5h` (`socks5h` resolves DNS through the proxy).
+- `url` is `host:port` or a full URL, and must never embed credentials. Use `username` plus `passwordEnv` (the name of an environment variable) instead; the password itself is never stored in config.
+- `enabled: false` hides a proxy from selection but keeps it.
+- `noProxy` lists hosts that bypass the proxy, same syntax as `NO_PROXY`.
+- Precedence per session: explicit session choice, then config `default`, then system environment, then direct. Unknown or disabled proxies fail fast instead of silently going direct.
+- Loopback targets bypass remote proxies (which could not reach them), but still route through a loopback proxy such as a local forwarder.
+- The OpenAI Codex WebSocket transport tunnels HTTP(S) proxies via CONNECT; sessions pinned to a SOCKS proxy use HTTP(S) for those requests instead (the WS runtime cannot tunnel SOCKS). Proxy credentials are never sent to the origin server.
+
+---
+
 ## Custom certificates
 
 If your enterprise uses custom CAs for HTTPS connections, configure OpenCode to trust them.

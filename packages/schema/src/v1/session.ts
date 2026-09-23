@@ -554,6 +554,7 @@ export const SessionInfo = Schema.Struct({
   share: optional(SessionShare),
   title: Schema.String,
   agent: optional(Schema.String),
+  proxyID: optional(Schema.String),
   model: optional(SessionModel),
   version: Schema.String,
   metadata: optional(Schema.Record(Schema.String, Schema.Any)),

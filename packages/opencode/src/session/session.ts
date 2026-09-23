@@ -85,6 +85,7 @@ export function fromRow(row: SessionRow): Info {
     parentID: row.parent_id ?? undefined,
     title: row.title,
     agent: row.agent ?? undefined,
+    proxyID: row.proxy_id ?? undefined,
     model: row.model
       ? {
           id: ModelV2.ID.make(row.model.id),
@@ -128,6 +129,7 @@ export function toRow(info: Info) {
     path: info.path,
     title: info.title,
     agent: info.agent,
+    proxy_id: info.proxyID,
     model: info.model,
     version: info.version,
     share_url: info.share?.url,
@@ -235,6 +237,7 @@ export const Info = Schema.Struct({
   share: optional(Share),
   title: Schema.String,
   agent: optional(Schema.String),
+  proxyID: optional(Schema.String),
   model: optional(Model),
   version: Schema.String,
   metadata: optional(Metadata),
@@ -262,6 +265,7 @@ export const CreateInput = Schema.optional(
     parentID: Schema.optional(SessionID),
     title: Schema.optional(Schema.String),
     agent: Schema.optional(Schema.String),
+    proxyID: Schema.optional(Schema.String),
     model: Schema.optional(Model),
     metadata: Schema.optional(Metadata),
     permission: Schema.optional(PermissionV1.Ruleset),
@@ -417,6 +421,7 @@ export interface Interface {
     parentID?: SessionID
     title?: string
     agent?: string
+    proxyID?: string
     model?: Schema.Schema.Type<typeof Model>
     metadata?: typeof Metadata.Type
     permission?: PermissionV1.Ruleset
@@ -434,6 +439,7 @@ export interface Interface {
     model: NonNullable<Info["model"]>
     time: number
   }) => Effect.Effect<void>
+  readonly setProxy: (input: { sessionID: SessionID; proxyID: Info["proxyID"] }) => Effect.Effect<void>
   readonly setPermission: (input: { sessionID: SessionID; permission: PermissionV1.Ruleset }) => Effect.Effect<void>
   readonly setRevert: (input: {
     sessionID: SessionID
@@ -500,6 +506,7 @@ const layer: Layer.Layer<
       id?: SessionID
       title?: string
       agent?: string
+      proxyID?: string
       model?: Schema.Schema.Type<typeof Model>
       parentID?: SessionID
       workspaceID?: WorkspaceV2.ID
@@ -520,6 +527,7 @@ const layer: Layer.Layer<
         parentID: input.parentID,
         title: input.title ?? (input.parentID ? childTitlePrefix : parentTitlePrefix) + new Date().toISOString(),
         agent: input.agent,
+        proxyID: input.proxyID,
         model: input.model,
         metadata: input.metadata,
         permission: input.permission ? [...input.permission] : undefined,
@@ -668,6 +676,7 @@ const layer: Layer.Layer<
       parentID?: SessionID
       title?: string
       agent?: string
+      proxyID?: string
       model?: Schema.Schema.Type<typeof Model>
       metadata?: typeof Metadata.Type
       permission?: PermissionV1.Ruleset
@@ -681,6 +690,7 @@ const layer: Layer.Layer<
         path: sessionPath(ctx.worktree, ctx.directory),
         title: input?.title,
         agent: input?.agent,
+        proxyID: input?.proxyID,
         model: input?.model,
         metadata: input?.metadata,
         permission: input?.permission,
@@ -697,6 +707,7 @@ const layer: Layer.Layer<
         path: sessionPath(ctx.worktree, ctx.directory),
         workspaceID: original.workspaceID,
         title,
+        proxyID: original.proxyID,
         metadata: structuredClone(original.metadata),
       })
       const msgs = yield* messages({ sessionID: input.sessionID })
@@ -773,6 +784,13 @@ const layer: Layer.Layer<
         model: input.model,
         time: { updated: input.time },
       }).pipe(Effect.orDie)
+    })
+
+    const setProxy = Effect.fn("Session.setProxy")(function* (input: {
+      sessionID: SessionID
+      proxyID: Info["proxyID"]
+    }) {
+      yield* patch(input.sessionID, { proxyID: input.proxyID, time: { updated: Date.now() } }).pipe(Effect.orDie)
     })
 
     const setPermission = Effect.fn("Session.setPermission")(function* (input: {
@@ -914,6 +932,7 @@ const layer: Layer.Layer<
       setArchived,
       setMetadata,
       setAgentModel,
+      setProxy,
       setPermission,
       setRevert,
       clearRevert,

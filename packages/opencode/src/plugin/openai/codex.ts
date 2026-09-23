@@ -5,6 +5,9 @@ import os from "os"
 import { setTimeout as sleep } from "node:timers/promises"
 import { createServer } from "http"
 import { OpenAIWebSocketPool } from "./ws-pool"
+import { OpenAIWebSocket } from "./ws"
+import type { ConfigProxyV1 } from "@opencode-ai/core/v1/config/proxy"
+import { Proxy as SessionProxy } from "@/proxy/proxy"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -270,6 +273,106 @@ function waitForOAuthCallback(pkce: PkceCodes, state: string): Promise<TokenResp
   })
 }
 
+// Resolve the session proxy for a WebSocket connect, mirroring the HTTP
+// paths: explicit session choice, then config default, then system env, then
+// direct — evaluated against the real target host so per-host noProxy rules
+// apply. An unreadable session falls back to default/env (no explicit choice
+// to honor); an unreadable config reuses the last good table, or throws when
+// nothing was ever read — so a transient outage degrades instead of silently
+// dropping a configured default. Misconfiguration (unknown/disabled ids,
+// missing passwordEnv) always throws. Garbage targets throw
+// InvalidProxyTargetError so the pool can fall back to plain HTTP.
+//
+// NOTE: the legacy SDK types predate the proxy fields, so proxyID/proxy are
+// read via casts — the server already serializes them. Regenerating the SDK
+// removes the need for the casts, not the reads.
+// Exported for plugin.codex tests (same precedent as renderOAuthError).
+// Returns the proxy URL with userinfo intact: the WebSocket runtime tunnels
+// CONNECT itself and authenticates from the URL, so credentials must never
+// be split into upgrade headers (they would reach the origin instead).
+export async function resolveSessionProxy(
+  client: PluginInput["client"] | undefined,
+  sessionID: string | undefined,
+  input: string | URL | Request,
+): Promise<string | undefined> {
+  // No client (tests, client-less hosts): cannot resolve, so direct — same
+  // fallback posture as the session LLM resolver when Session is unavailable.
+  if (!client) return undefined
+  // Duck-typed extraction: cross-realm URL instances fail `instanceof` and
+  // have no `.url`, so prefer an `.href` string, then `.url`. Anything else
+  // (e.g. String() yielding "[object Object]") would mis-evaluate per-host
+  // noProxy rules, so require a parseable URL instead of trusting it.
+  const candidate =
+    typeof input === "string"
+      ? input
+      : typeof (input as URL).href === "string"
+        ? (input as URL).href
+        : typeof (input as Request).url === "string"
+          ? (input as Request).url
+          : undefined
+  if (!candidate || !URL.canParse(candidate)) throw new OpenAIWebSocket.InvalidProxyTargetError()
+  // A missing session (deleted mid-flight, unknown id) falls back to default
+  // / env — there is simply no explicit choice to honor.
+  const proxyID = sessionID
+    ? await client.session
+        .get({ path: { id: sessionID } })
+        .then(
+          (result) => (result.data as unknown as { proxyID?: string } | undefined)?.proxyID,
+          () => undefined,
+        )
+    : undefined
+  // The config table carries the default plus every named entry. The last
+  // good read is cached module-wide so a transient store blip degrades to
+  // the previous table (defaults preserved) instead of failing every WS
+  // connect; a genuinely first-run failure with nothing cached still fails
+  // loud rather than silently dropping a configured default for env/direct.
+  // (Only the session read degrades to undefined — an absent session just
+  // means no explicit choice, while an absent table means defaults are
+  // unknowable.)
+  const proxyConfig = await client.config.get({}).then(
+    (result) => {
+      const proxy = (result.data as unknown as { proxy?: ConfigProxyV1.Info })?.proxy
+      lastKnownProxyConfig = proxy
+      return proxy
+    },
+    () => {
+      if (lastKnownProxyConfig === UNSET) throw new Error("Proxy config unavailable")
+      return lastKnownProxyConfig
+    },
+  )
+  // Map WS schemes to HTTPS so per-host noProxy matching evaluates the real
+  // target; anchored case-insensitively so WSS:// variants resolve correctly.
+  // Seed the eviction tracker from the same read that routes this request:
+  // the first session.updated must compare against the choice that actually
+  // dialed the pooled socket, not an empty map (which would either churn on
+  // routine updates or — worse — swallow a switch that happened before any
+  // update was observed and keep reusing the stale socket).
+  const resolved = SessionProxy.resolveForSession({
+    proxyID,
+    proxy: proxyConfig,
+    url: candidate.replace(/^wss:/i, "https:").replace(/^ws:/i, "http:"),
+  })
+  if (sessionID) lastSeenProxyID.set(sessionID, proxyID)
+  return resolved.kind === "direct" ? undefined : resolved.url
+}
+
+// Last-seen explicit choice per session, seeded by resolveSessionProxy (the
+// same read that dials the socket) so session.updated compares against
+// ground truth instead of an empty map. Module-level: resolutions and plugin
+// event handlers share one tracker across loader invocations. Exported for
+// tests (same precedent as resolveSessionProxy/renderOAuthError).
+export const lastSeenProxyID = new Map<string, string | undefined>()
+
+// Last good proxy table, shared across resolutions. A transient config-store
+// blip then degrades to the previous table instead of failing every WS
+// connect; UNSET (never successfully read) still fails loud. Exported for
+// tests so outage scenarios can reset deterministically.
+const UNSET = Symbol("unset-proxy-config")
+export let lastKnownProxyConfig: ConfigProxyV1.Info | undefined | typeof UNSET = UNSET
+export const resetProxyConfigCache = () => {
+  lastKnownProxyConfig = UNSET
+}
+
 export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPluginOptions = {}): Promise<Hooks> {
   const issuer = options.issuer ?? ISSUER
   const codexApiEndpoint = options.codexApiEndpoint ?? CODEX_API_ENDPOINT
@@ -282,8 +385,30 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
       websocketFetches.length = 0
     },
     async event(input) {
-      if (input.event.type !== "session.deleted") return
-      for (const websocketFetch of websocketFetches) websocketFetch.remove(input.event.properties.info.id)
+      if (input.event.type !== "session.deleted" && input.event.type !== "session.updated") return
+      const id = input.event.properties.info.id
+      if (input.event.type === "session.deleted") {
+        lastSeenProxyID.delete(id)
+        for (const websocketFetch of websocketFetches) websocketFetch.remove(id)
+        return
+      }
+      // Evict only on actual proxy switches: routine updates (title, touch)
+      // must not churn pooled sockets. The next request then re-resolves and
+      // dials under the new selection. (Legacy event types predate proxyID;
+      // the server serializes it — same cast posture as resolveSessionProxy.)
+      // The tracker is seeded by resolveSessionProxy at dial time, so this
+      // compares against the choice the pooled socket actually uses — a
+      // switch that happened before any update was observed still evicts.
+      // Sessions never seen by the resolver (no WS traffic yet) have nothing
+      // pooled, so an unseen id seeds silently without evicting.
+      const proxyID = (input.event.properties.info as unknown as { proxyID?: string }).proxyID
+      if (!lastSeenProxyID.has(id)) {
+        lastSeenProxyID.set(id, proxyID)
+        return
+      }
+      if (lastSeenProxyID.get(id) === proxyID) return
+      lastSeenProxyID.set(id, proxyID)
+      for (const websocketFetch of websocketFetches) websocketFetch.remove(id)
     },
     provider: {
       id: "openai",
@@ -330,7 +455,10 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
       async loader(getAuth) {
         const auth = await getAuth()
         const websocketFetch = options.experimentalWebSockets
-          ? OpenAIWebSocketPool.createWebSocketFetch({ httpFetch: fetch })
+          ? OpenAIWebSocketPool.createWebSocketFetch({
+              httpFetch: fetch,
+              proxy: (sessionID, url) => resolveSessionProxy(input.client, sessionID, url),
+            })
           : undefined
         if (websocketFetch) {
           websocketFetches.push(websocketFetch)

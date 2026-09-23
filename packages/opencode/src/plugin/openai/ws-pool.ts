@@ -1,4 +1,5 @@
 import WebSocket from "ws"
+import { createHash } from "node:crypto"
 import { ProviderError } from "@/provider/error"
 import { isRecord } from "@/util/record"
 import { OpenAIWebSocket } from "./ws"
@@ -12,6 +13,14 @@ export interface CreateWebSocketFetchOptions {
   idleTimeout?: number
   maxConnectionAge?: number
   streamRetries?: number
+  // Resolves the session proxy URL for a connect. Receives the request URL
+  // (string form of RequestInfo) so resolution honors per-host noProxy rules;
+  // may throw on misconfiguration (callers fail fast instead of silently
+  // going direct).
+  proxy?: (
+    sessionID: string | undefined,
+    url: string | URL | Request,
+  ) => string | undefined | Promise<string | undefined>
 }
 
 interface PoolEntry {
@@ -21,6 +30,10 @@ interface PoolEntry {
   busy: boolean
   fallback: boolean
   streamFailures: number
+  sessionID: string
+  // Redacted proxy label for debugging only — never credentials. The key
+  // carries the hash; this field keeps entries attributable.
+  proxy: string
 }
 
 const DEFAULT_CONNECT_TIMEOUT = 15_000
@@ -40,8 +53,29 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     pruneTimer.unref()
   }
 
+  // Selections the WS transport already failed, keyed by session plus a hash
+  // of the FULL proxy URL and carrying the exact sessionID. The hash (not a
+  // redacted label) distinguishes credential rotations: `bot:old@` and
+  // `bot:new@` redact identically but must not share entries or verdicts.
+  // Consulted after resolution (which must still run per request — see below)
+  // but before pool lookup and dialing, so known-bad selections serve HTTP
+  // without re-dialing or re-handshaking. Exact session match on removal:
+  // prefix matching would confuse `foo` with `foo:bar`.
+  const unsupportedSelections = new Map<string, string>()
+  const selectionFingerprint = (proxy: string | undefined) =>
+    proxy ? createHash("sha256").update(proxy).digest("hex") : "direct"
+  const unsupportedKey = (sessionID: string, proxy: string | undefined) =>
+    `${sessionID}:${selectionFingerprint(proxy)}`
+
   async function websocketFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-    const url = input instanceof URL ? input.toString() : typeof input === "string" ? input : input.url
+    // Duck-typed: cross-realm URL instances fail `instanceof` but still carry
+    // a string `.href`; plain Request objects carry `.url`.
+    const url =
+      typeof input === "string"
+        ? input
+        : typeof (input as URL).href === "string"
+          ? (input as URL).href
+          : (input as Request).url
     const internalHeaders = OpenAIWebSocket.normalizeHeaders(init?.headers)
     const httpInit = withoutInternalHeaders(init)
 
@@ -64,12 +98,46 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     }
 
     const sessionID = internalHeaders["x-session-affinity"] ?? internalHeaders["session-id"]
+    // No session affinity (non-streamed POSTs, fallback callers): direct to
+    // the wrapped HTTP fetch untouched. Proxy routing lives in the outer
+    // provider fetch wrapper — this inner websocketFetch only handles the
+    // session-scoped streaming upgrade, so resolving a config default here
+    // would double-apply routing and mis-key direct traffic as proxied.
     if (!sessionID) {
       return httpFetch(input, httpInit)
     }
-    const key = `${sessionID}:conversation`
+    // Resolve per connect (not per pool entry, and not cached): the pool key
+    // embeds the resolution output, so the lookup itself needs it, and
+    // caching URLs would go stale on proxy switches or password rotation
+    // with no invalidation signal. The two loopback reads are cheap next to
+    // a WS handshake. Misconfiguration throws (unknown/disabled proxy)
+    // propagate and fail fast; only unusable targets fall back to plain HTTP
+    // below, which surfaces its own invalid-URL error.
+    let proxy: string | undefined
+    try {
+      proxy = await options?.proxy?.(sessionID, input)
+    } catch (error) {
+      if (!OpenAIWebSocket.isInvalidProxyTargetError(error)) throw error
+      return httpFetch(input, httpInit)
+    }
+    // Keys hash the full URL (never the raw credentials, never a redacted
+    // label alone): rotations must not reuse sockets authenticated under old
+    // secrets, and secrets must not linger in the Map or surface via
+    // debugging. Attributability lives on the entry's redacted label.
+    const selectionKey = unsupportedKey(sessionID, proxy)
+    if (unsupportedSelections.get(selectionKey) === sessionID) {
+      return httpFetch(input, httpInit)
+    }
+    const key = `${selectionKey}:conversation`
 
-    const entry = pool.get(key) ?? { lastUsedAt: Date.now(), busy: false, fallback: false, streamFailures: 0 }
+    const entry = pool.get(key) ?? {
+      lastUsedAt: Date.now(),
+      busy: false,
+      fallback: false,
+      streamFailures: 0,
+      sessionID,
+      proxy: proxy ? OpenAIWebSocket.redactProxyLabel(proxy) : "direct",
+    }
     pool.set(key, entry)
 
     if (entry.fallback) {
@@ -89,6 +157,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         connectTimeout,
         maxConnectionAge,
         init?.signal,
+        proxy,
       )
       let resolveFirstEvent: (event: boolean | OpenAIWebSocket.WrappedError) => void = () => {}
       let rejectFirstEvent: (error: Error) => void = () => {}
@@ -150,6 +219,15 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         throw error
       }
 
+      // A session proxy the WebSocket transport cannot use is permanent for
+      // this selection: skip retries and serve HTTP (itself proxy-routed)
+      // on the first failure instead of erroring repeatedly. Recorded both
+      // on the entry and in the selection set so later requests skip pool
+      // lookup, resolution, and dialing entirely.
+      if (OpenAIWebSocket.isProxyUnsupportedError(error)) {
+        entry.fallback = true
+        unsupportedSelections.set(selectionKey, sessionID)
+      }
       recordStreamFailure(entry)
       invalidate(entry)
       if (entry.fallback) return httpFetch(input, httpInit)
@@ -182,17 +260,34 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     clearInterval(pruneTimer)
     for (const entry of pool.values()) invalidate(entry)
     pool.clear()
+    unsupportedSelections.clear()
   }
 
   function remove(sessionID: string) {
-    const key = `${sessionID}:conversation`
-    const entry = pool.get(key)
-    if (!entry) return
-    invalidate(entry)
-    pool.delete(key)
+    // Pool keys carry the effective proxy, so one session may own several
+    // entries across proxy switches — match on the stored sessionID exactly
+    // (never by string prefix, where `foo` would also match `foo:bar`).
+    for (const [key, entry] of pool) {
+      if (entry.sessionID !== sessionID) continue
+      invalidate(entry)
+      pool.delete(key)
+    }
+    for (const [selection, owner] of unsupportedSelections) {
+      if (owner === sessionID) unsupportedSelections.delete(selection)
+    }
   }
 
-  return Object.assign(websocketFetch, { close, remove })
+  function has(sessionID: string) {
+    for (const entry of pool.values()) {
+      if (entry.sessionID === sessionID) return true
+    }
+    for (const owner of unsupportedSelections.values()) {
+      if (owner === sessionID) return true
+    }
+    return false
+  }
+
+  return Object.assign(websocketFetch, { close, remove, has })
 }
 
 function connectionLimitError(event: Record<string, unknown>) {
@@ -221,6 +316,7 @@ async function socket(
   connectTimeout: number,
   maxConnectionAge: number,
   signal?: AbortSignal | null,
+  proxy?: string,
 ) {
   if (
     entry.socket?.readyState === WebSocket.OPEN &&
@@ -236,6 +332,7 @@ async function socket(
     headers,
     timeout: connectTimeout,
     signal: signal ?? undefined,
+    proxy,
   })
   entry.connectedAt = Date.now()
   return next

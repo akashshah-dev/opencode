@@ -21,6 +21,7 @@ export const Info = Schema.Struct({
   parentID: ID.pipe(optional),
   projectID: Project.ID,
   agent: Agent.ID.pipe(optional),
+  proxyID: Schema.String.pipe(optional),
   model: Model.Ref.pipe(optional),
   cost: Schema.Finite,
   tokens: Schema.Struct({

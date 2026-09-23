@@ -16,6 +16,7 @@ export interface ConnectResponsesWebSocketOptions {
   headers: Record<string, string>
   timeout?: number
   signal?: AbortSignal
+  proxy?: string
 }
 
 export interface StreamResponsesWebSocketOptions {
@@ -69,6 +70,60 @@ export function isAbortError(error: unknown): error is DOMException {
   return error instanceof DOMException && error.name === "AbortError"
 }
 
+// Redact userinfo (never emit passwords); keep the host so the error stays
+// attributable to the offending selection.
+export function redactProxyLabel(proxy: string) {
+  if (URL.canParse(proxy)) {
+    const parsed = new URL(proxy)
+    if (parsed.password) parsed.password = "***"
+    return parsed.toString()
+  }
+  // Greedy to the LAST `@`: passwords may contain `/`, whitespace, or `@`
+  // themselves, and anything narrower returns such inputs unchanged with the
+  // secret intact (e.g. `http://bot:s3/cret@host/`). Over-redacting an
+  // already-invalid string is safe; under-redacting leaks.
+  return proxy.replace(/^(.*:\/\/)?([\s\S]+)@/u, (_, scheme: string | undefined, user: string) => {
+    // Keep the mask marker only when a password segment was present, so
+    // `bot@host` stays as-is while `bot:s3cret@host` reads `bot:***@host`.
+    const masked = user.includes(":") ? ":***" : ""
+    return `${scheme ?? ""}${user.split(":")[0]}${masked}@`
+  })
+}
+
+export class ProxyUnsupportedError extends Error {
+  // Stores only the redacted label: the raw URL carries userinfo for CONNECT
+  // tunneling and must never linger on a thrown object where serializers or
+  // telemetry could capture it.
+  readonly proxy: string
+  constructor(proxy: string) {
+    super(
+      `Session proxy "${redactProxyLabel(proxy)}" cannot route WebSockets under this runtime (SOCKS tunneling is unsupported); ` +
+        `switch the session to Direct or an HTTP(S) proxy.`,
+    )
+    this.name = "ProxyUnsupportedError"
+    this.proxy = redactProxyLabel(proxy)
+  }
+}
+
+export function isProxyUnsupportedError(error: unknown): error is ProxyUnsupportedError {
+  return error instanceof ProxyUnsupportedError
+}
+
+// Thrown when the request target itself is unusable for proxy resolution
+// (empty or unparseable URL). Distinct from misconfiguration errors so
+// callers can fall back to the wrapped HTTP fetch — which surfaces its own
+// invalid-URL error — instead of failing the whole request.
+export class InvalidProxyTargetError extends Error {
+  constructor() {
+    super("Cannot resolve session proxy: invalid request URL")
+    this.name = "InvalidProxyTargetError"
+  }
+}
+
+export function isInvalidProxyTargetError(error: unknown): error is InvalidProxyTargetError {
+  return error instanceof InvalidProxyTargetError
+}
+
 export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOptions) {
   return new Promise<WebSocket>((resolve, reject) => {
     if (options.signal?.aborted) {
@@ -83,12 +138,36 @@ export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOpti
     delete headers["content-length"]
 
     // Bun does not apply HTTP(S)_PROXY to WebSockets unless the proxy is supplied explicitly.
+    // An explicit session proxy wins over the environment. The runtime tunnels
+    // CONNECT itself for http(s) proxy URLs — including userinfo auth, which
+    // MUST stay in the proxy URL: splitting credentials into upgrade headers
+    // would send Proxy-Authorization to the origin (verified live) while the
+    // tunneled leg goes out unauthenticated. SOCKS cannot be tunneled, so an
+    // explicit SOCKS session proxy rejects here instead of silently bypassing
+    // the proxy while the HTTP path uses it.
+    // Parse the scheme case-insensitively so SOCKS5:// or padded values can't
+    // slip through to the CONNECT path. Trim once and reuse the trimmed value
+    // so a padded proxy never reaches the dial with whitespace intact.
+    const trimmedProxy = options.proxy?.trim() || undefined
+    const proxyScheme = (() => {
+      const value = trimmedProxy ?? ""
+      const separator = value.indexOf("://")
+      if (separator === -1) return value.toLowerCase()
+      return value.slice(0, separator).toLowerCase()
+    })()
+    if (trimmedProxy && proxyScheme.startsWith("socks")) {
+      reject(new ProxyUnsupportedError(trimmedProxy))
+      return
+    }
+    // Anchored case-insensitively like the codex resolver mapping, so an
+    // uppercase WSS:// target still matches env-proxy rules instead of
+    // silently going direct.
     const proxy =
-      typeof Bun === "undefined"
+      trimmedProxy ??
+      (typeof Bun === "undefined"
         ? undefined
-        : ProxyEnv.getProxyForUrl(options.url.replace(/^wss:/, "https:").replace(/^ws:/, "http:"))
-    const connect = { headers, ...(proxy ? { proxy } : {}) }
-    const socket = new WebSocket(options.url, connect)
+        : ProxyEnv.getProxyForUrl(options.url.replace(/^wss:/i, "https:").replace(/^ws:/i, "http:")))
+    const socket = new WebSocket(options.url, { headers, ...(proxy ? { proxy } : {}) })
     const timeout = options.timeout
       ? setTimeout(() => {
           cleanup()

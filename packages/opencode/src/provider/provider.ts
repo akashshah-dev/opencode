@@ -25,7 +25,9 @@ import { EffectPromise } from "@/effect/promise"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { isRecord } from "@/util/record"
 import { optional } from "@opencode-ai/core/schema"
+import { ProxyFetch } from "@/proxy/fetch"
 import { ProviderTransform } from "./transform"
+import { SnowflakeTransform } from "./snowflake-transform"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ModelStatus } from "./model-status"
@@ -943,56 +945,8 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         oauthToken !== undefined && envToken === undefined && apiKeyToken === undefined && configToken === undefined
       if (!useOAuthHandler) {
         options.fetch = async (url: RequestInfo | URL, init?: RequestInit) => {
-          if (init?.body && typeof init.body === "string") {
-            try {
-              const body = JSON.parse(init.body)
-              if ("max_tokens" in body) {
-                body.max_completion_tokens = body.max_tokens
-                delete body.max_tokens
-                init = { ...init, body: JSON.stringify(body) }
-              }
-            } catch {}
-          }
-
-          const response = await fetch(url, init)
-
-          if (!response.ok && response.status === 400) {
-            try {
-              const errorData = await response.clone().json()
-              const errorMessage = String(errorData.message || errorData.error || "")
-              if (errorMessage.toLowerCase().includes("conversation complete")) {
-                return new Response(
-                  JSON.stringify({
-                    choices: [{ finish_reason: "stop", message: { content: "", role: "assistant" } }],
-                  }),
-                  { status: 200, headers: new Headers({ "content-type": "application/json" }) },
-                )
-              }
-            } catch {}
-          }
-
-          if (response.body && response.headers.get("content-type")?.includes("text/event-stream")) {
-            const reader = response.body.getReader()
-            const encoder = new TextEncoder()
-            const decoder = new TextDecoder()
-            const stream = new ReadableStream({
-              async pull(ctrl) {
-                const { done, value } = await reader.read()
-                if (done) {
-                  ctrl.close()
-                  return
-                }
-                const text = decoder.decode(value, { stream: true })
-                ctrl.enqueue(encoder.encode(text.replace(/"role"\s*:\s*""/g, '"role":"assistant"')))
-              },
-              cancel() {
-                reader.cancel()
-              },
-            })
-            return new Response(stream, { headers: response.headers, status: response.status })
-          }
-
-          return response
+          const response = await fetch(url, { ...init, body: SnowflakeTransform.transformRequestBody(init?.body) })
+          return SnowflakeTransform.normalizeResponse(response)
         }
       }
 
@@ -1196,7 +1150,10 @@ export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
   readonly getModel: (providerID: ProviderV2.ID, modelID: ModelV2.ID) => Effect.Effect<Model, ModelNotFoundError>
-  readonly getLanguage: (model: Model) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
+  readonly getLanguage: (
+    model: Model,
+    options?: { proxy?: ProxyFetch.Selection },
+  ) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
   readonly closest: (
     providerID: ProviderV2.ID,
     query: string[],
@@ -1212,6 +1169,7 @@ interface State {
   sdk: Map<string, BundledSDK>
   modelLoaders: Record<string, CustomModelLoader>
   varsLoaders: Record<string, CustomVarsLoader>
+  proxyPool: ProxyFetch.Pool
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Provider") {}
@@ -1725,13 +1683,19 @@ const layer = Layer.effect(
           sdk,
           modelLoaders,
           varsLoaders,
+          proxyPool: ProxyFetch.createPool(),
         }
       }),
     )
 
     const list = Effect.fn("Provider.list")(() => InstanceState.use(state, (s) => s.providers))
 
-    async function resolveSDK(model: Model, s: State, envs: Record<string, string | undefined>) {
+    async function resolveSDK(
+      model: Model,
+      s: State,
+      envs: Record<string, string | undefined>,
+      proxy: ProxyFetch.Selection,
+    ) {
       try {
         const provider = s.providers[model.providerID]
         const options = { ...provider.options }
@@ -1790,6 +1754,7 @@ const layer = Layer.effect(
             providerID: model.providerID,
             npm: model.api.npm,
             options,
+            proxy: ProxyFetch.key(proxy),
           }),
         )
         const existing = s.sdk.get(key)
@@ -1802,7 +1767,6 @@ const layer = Layer.effect(
         delete options["headerTimeout"]
 
         options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
-          const fetchFn = customFetch ?? fetch
           const opts = init ?? {}
           const chunkAbortCtl = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
           const headerTimeoutMs = headerTimeout === false ? undefined : headerTimeout
@@ -1818,11 +1782,34 @@ const layer = Layer.effect(
           const combined = signals.length === 0 ? null : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
           if (combined) opts.signal = combined
 
-          const res = await fetchFn(input, {
-            ...opts,
-            // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
-            timeout: false,
-          }).finally(() => headerTimeoutCtl?.clear())
+          // Per-session proxy routing. Direct resolutions fall through to the
+          // existing fetch path unchanged; routed requests use a pooled
+          // dispatcher. Custom provider fetches are bypassed on the proxied
+          // path (OAuth refresh, per-provider transforms), so any wire-format
+          // transform a custom fetch would have applied must be composed here
+          // or the provider rejects the request. Gate on providerID alone:
+          // Snowflake's non-OAuth custom fetch always transforms, AND its
+          // OAuth plugin fetch always transforms too (same shared module), so
+          // both token kinds need it on the proxied path. Custom
+          // Snowflake-compatible endpoints under other ids bypass both custom
+          // fetches on both paths — they never needed the transform and still
+          // don't get it either way.
+          const snowflake = model.providerID === "snowflake-cortex"
+          const proxied = ProxyFetch.fetch(
+            s.proxyPool,
+            proxy,
+            input,
+            snowflake ? { ...opts, body: SnowflakeTransform.transformRequestBody(opts?.body) } : opts,
+          )
+          const dispatched =
+            proxied != null
+              ? proxied.then((response) => (snowflake ? SnowflakeTransform.normalizeResponse(response) : response))
+              : (customFetch ?? fetch)(input, {
+                  ...opts,
+                  // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
+                  timeout: false,
+                })
+          const res = await dispatched.finally(() => headerTimeoutCtl?.clear())
 
           if (!chunkAbortCtl) return res
           return wrapSSE(res, chunkTimeout, chunkAbortCtl)
@@ -1893,16 +1880,19 @@ const layer = Layer.effect(
       return info
     })
 
-    const getLanguage = Effect.fn("Provider.getLanguage")(function* (model: Model) {
+    const getLanguage = Effect.fn("Provider.getLanguage")(function* (model: Model, options?: {
+      proxy?: ProxyFetch.Selection
+    }) {
       const s = yield* InstanceState.get(state)
       const envs = yield* env.all()
-      const key = `${model.providerID}/${model.id}`
+      const proxy = options?.proxy ?? {}
+      const key = `${model.providerID}/${model.id}/${ProxyFetch.key(proxy)}`
       if (s.models.has(key)) return s.models.get(key)!
 
       const provider = s.providers[model.providerID]
       return yield* EffectPromise.refineRejection(
         async () => {
-          const sdk = await resolveSDK(model, s, envs)
+          const sdk = await resolveSDK(model, s, envs, proxy)
           const language = s.modelLoaders[model.providerID]
             ? await s.modelLoaders[model.providerID](
                 sdk,

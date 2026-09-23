@@ -387,6 +387,23 @@ describe("session.llm-native.request", () => {
     ).toThrow("Native LLM request adapter does not support provider package unknown-provider")
   })
 
+  test("carries the session proxy URL into request http options", () => {
+    const request = LLMNative.request({
+      model: baseModel,
+      messages: [{ role: "user", content: "hello" }],
+      proxy: "http://127.0.0.1:8080/",
+    })
+    expect(request.http?.proxy).toBe("http://127.0.0.1:8080/")
+  })
+
+  test("omits http options without a session proxy", () => {
+    const request = LLMNative.request({
+      model: baseModel,
+      messages: [{ role: "user", content: "hello" }],
+    })
+    expect(request.http).toBeUndefined()
+  })
+
   test("only enables native runtime for supported OpenAI API-key models", () => {
     expect(LLMNativeRuntime.status({ model: baseModel, provider: providerInfo, auth: undefined })).toMatchObject({
       type: "supported",

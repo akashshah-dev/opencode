@@ -22,6 +22,7 @@ export type RequestInput = {
   readonly model: Provider.Model
   readonly apiKey?: string
   readonly baseURL?: string
+  readonly proxy?: string
   readonly system?: readonly string[]
   readonly messages: readonly ModelMessage[]
   readonly tools?: Record<string, ToolInput>
@@ -190,6 +191,7 @@ export const request = (input: RequestInput) => {
     toolChoice: input.toolChoice,
     generation: generation(input),
     providerOptions: input.providerOptions,
+    ...(input.proxy ? { http: { proxy: input.proxy } } : {}),
   })
 }
 

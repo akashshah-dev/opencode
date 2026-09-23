@@ -425,6 +425,229 @@ describe("RequestExecutor", () => {
     }).pipe(Effect.provideService(Random.Random, randomMidpoint)),
   )
 
+  it.effect("routes http targets through an http proxy in absolute form", () =>
+    Effect.gen(function* () {
+      const seen: string[] = []
+      const server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: (req) => {
+          seen.push(`${req.method} ${req.url}`)
+          return new Response("ok", { status: 200 })
+        },
+      })
+      try {
+        const executor = yield* RequestExecutor.Service
+        const response = yield* executor.execute(
+          HttpClientRequest.get(`http://127.0.0.1:${server.port}/llm`),
+          { proxy: `http://127.0.0.1:${server.port}/` },
+        )
+        expect(response.status).toBe(200)
+        expect(seen).toHaveLength(1)
+        expect(seen[0]).toBe(`GET http://127.0.0.1:${server.port}/llm`)
+      } finally {
+        server.stop()
+      }
+    }).pipe(Effect.provide(RequestExecutor.fetchLayer)),
+  )
+
+  it.effect("fails fast when the proxy demands auth", () =>
+    Effect.gen(function* () {
+      const server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: () =>
+          new Response("proxy auth required", {
+            status: 407,
+            headers: { "proxy-authenticate": 'Basic realm="proxy"' },
+          }),
+      })
+      try {
+        const executor = yield* RequestExecutor.Service
+        const error = yield* executor
+          .execute(HttpClientRequest.get(`http://127.0.0.1:${server.port}/llm`), {
+            proxy: `http://127.0.0.1:${server.port}/`,
+          })
+          .pipe(Effect.flip)
+        expectLLMError(error)
+        expect(error.reason).toMatchObject({ _tag: "UnknownProvider", status: 407 })
+      } finally {
+        server.stop()
+      }
+    }).pipe(Effect.provide(RequestExecutor.fetchLayer)),
+  )
+
+  it.effect("refuses to send loopback targets to remote proxies", () =>
+    Effect.gen(function* () {
+      const executor = yield* RequestExecutor.Service
+      const error = yield* executor
+        .execute(HttpClientRequest.get("http://127.0.0.1:9/llm"), { proxy: "http://proxy.corp:8080/" })
+        .pipe(Effect.flip)
+      expectLLMError(error)
+      expect(error.reason).toMatchObject({ _tag: "Transport", kind: "proxy" })
+    }).pipe(Effect.provide(RequestExecutor.fetchLayer)),
+  )
+
+  it.effect("never sends cleartext to an https: proxy", () =>
+    Effect.gen(function* () {
+      const { createServer } = yield* Effect.promise(() => import("node:net"))
+      // Plaintext stub: records the first byte of every connection, then
+      // destroys it so the client handshake fails fast instead of hanging.
+      const firstBytes: number[] = []
+      const server = createServer((socket) => {
+        socket.once("data", (chunk: Buffer) => {
+          firstBytes.push(chunk[0] as number)
+          socket.destroy()
+        })
+      })
+      const port: number = yield* Effect.promise(
+        () =>
+          new Promise<number>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+              const address = server.address()
+              resolve(typeof address === "object" && address ? address.port : 0)
+            })
+          }),
+      )
+      try {
+        const executor = yield* RequestExecutor.Service
+        const error = yield* executor
+          .execute(HttpClientRequest.get(`http://127.0.0.1:${port}/llm`), {
+            proxy: `https://127.0.0.1:${port}/`,
+          })
+          .pipe(Effect.flip)
+        expectLLMError(error)
+        expect(error.reason).toMatchObject({ _tag: "Transport", kind: "proxy" })
+        expect(firstBytes.length).toBeGreaterThan(0)
+        // Every attempt must start with a TLS ClientHello (0x16), never a
+        // plaintext CONNECT ("C") carrying Proxy-Authorization in cleartext.
+        for (const first of firstBytes) expect(first).toBe(0x16)
+      } finally {
+        yield* Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve())))
+      }
+    }).pipe(Effect.provide(RequestExecutor.fetchLayer)),
+  )
+
+  it.effect("does not truncate split Content-Length bodies through a proxy", () =>
+    Effect.gen(function* () {
+      const body = "x".repeat(60) + "y".repeat(40)
+      const { createServer } = yield* Effect.promise(() => import("node:net"))
+      const server = createServer((socket) => {
+        let head = Buffer.alloc(0)
+        const onData = (chunk: Buffer) => {
+          head = Buffer.concat([head, chunk])
+          if (head.indexOf("\r\n\r\n") === -1) return
+          socket.off("data", onData)
+          // Split the 100-byte body as 60 + 40 across two writes to catch
+          // double-decrement framing bugs.
+          socket.write(`HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n${body.slice(0, 60)}`)
+          setTimeout(() => {
+            socket.write(body.slice(60))
+            socket.end()
+          }, 10)
+        }
+        socket.on("data", onData)
+      })
+      const port: number = yield* Effect.promise(
+        () =>
+          new Promise<number>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+              const address = server.address()
+              resolve(typeof address === "object" && address ? address.port : 0)
+            })
+          }),
+      )
+      try {
+        const executor = yield* RequestExecutor.Service
+        const response = yield* executor.execute(HttpClientRequest.get(`http://127.0.0.1:${port}/llm`), {
+          proxy: `http://127.0.0.1:${port}/`,
+        })
+        expect(response.status).toBe(200)
+        expect(yield* response.text).toBe(body)
+      } finally {
+        yield* Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve())))
+      }
+    }).pipe(Effect.provide(RequestExecutor.fetchLayer)),
+  )
+
+  it.effect("streams close-delimited bodies through a proxy until close", () =>
+    Effect.gen(function* () {
+      const body = "close-delimited-body"
+      const { createServer } = yield* Effect.promise(() => import("node:net"))
+      const server = createServer((socket) => {
+        let head = Buffer.alloc(0)
+        const onData = (chunk: Buffer) => {
+          head = Buffer.concat([head, chunk])
+          if (head.indexOf("\r\n\r\n") === -1) return
+          socket.off("data", onData)
+          socket.write(`HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n${body}`)
+          socket.end()
+        }
+        socket.on("data", onData)
+      })
+      const port: number = yield* Effect.promise(
+        () =>
+          new Promise<number>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+              const address = server.address()
+              resolve(typeof address === "object" && address ? address.port : 0)
+            })
+          }),
+      )
+      try {
+        const executor = yield* RequestExecutor.Service
+        const response = yield* executor.execute(HttpClientRequest.get(`http://127.0.0.1:${port}/llm`), {
+          proxy: `http://127.0.0.1:${port}/`,
+        })
+        expect(response.status).toBe(200)
+        expect(yield* response.text).toBe(body)
+      } finally {
+        yield* Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve())))
+      }
+    }).pipe(Effect.provide(RequestExecutor.fetchLayer)),
+  )
+
+  it.effect("surfaces truncated Content-Length bodies through a proxy as errors", () =>
+    Effect.gen(function* () {
+      const { createServer } = yield* Effect.promise(() => import("node:net"))
+      const server = createServer((socket) => {
+        let head = Buffer.alloc(0)
+        const onData = (chunk: Buffer) => {
+          head = Buffer.concat([head, chunk])
+          if (head.indexOf("\r\n\r\n") === -1) return
+          socket.off("data", onData)
+          // Declare 100 bytes but close after 60: truncation must error,
+          // not silently succeed with the prefix.
+          socket.write(`HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n${"x".repeat(60)}`)
+          socket.end()
+        }
+        socket.on("data", onData)
+      })
+      const port: number = yield* Effect.promise(
+        () =>
+          new Promise<number>((resolve) => {
+            server.listen(0, "127.0.0.1", () => {
+              const address = server.address()
+              resolve(typeof address === "object" && address ? address.port : 0)
+            })
+          }),
+      )
+      try {
+        const executor = yield* RequestExecutor.Service
+        const response = yield* executor.execute(HttpClientRequest.get(`http://127.0.0.1:${port}/llm`), {
+          proxy: `http://127.0.0.1:${port}/`,
+        })
+        expect(response.status).toBe(200)
+        const error = yield* response.text.pipe(Effect.flip)
+        // The body error surfaces wrapped as a decode failure — the point is
+        // it fails instead of silently succeeding with the 60-byte prefix.
+        expect(String(error)).toMatch(/decode|closed|completed/i)
+      } finally {
+        yield* Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve())))
+      }
+    }).pipe(Effect.provide(RequestExecutor.fetchLayer)),
+  )
+
   it.effect("does not retry after a successful response reaches stream parsing", () =>
     Effect.gen(function* () {
       const attempts = yield* Ref.make(0)

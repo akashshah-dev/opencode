@@ -502,6 +502,76 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
     const session = createSession()
 
+    function createProxy() {
+      const [proxyStore, setProxyStore] = createStore<{
+        ready: boolean
+        recent: string[]
+      }>({
+        ready: false,
+        recent: [],
+      })
+
+      const filePath = path.join(paths.state, "proxy.json")
+      const state = {
+        pending: false,
+      }
+
+      function save() {
+        if (!proxyStore.ready) {
+          state.pending = true
+          return
+        }
+        state.pending = false
+        void writeJsonAtomic(filePath, {
+          recent: proxyStore.recent,
+        })
+      }
+
+      readJson<unknown>(filePath)
+        .then((x) => {
+          if (!x || typeof x !== "object") return
+          const recent = (x as Record<string, unknown>).recent
+          if (Array.isArray(recent))
+            setProxyStore(
+              "recent",
+              recent.filter((item): item is string => typeof item === "string").slice(0, 10),
+            )
+        })
+        .catch(() => {})
+        .finally(() => {
+          setProxyStore("ready", true)
+          if (state.pending) save()
+        })
+
+      return {
+        get ready() {
+          return proxyStore.ready
+        },
+        recent() {
+          return proxyStore.recent
+        },
+        current(sessionID: string | undefined) {
+          if (!sessionID) return undefined
+          return sync.session.get(sessionID)?.proxyID
+        },
+        async set(sessionID: string, proxyID: string) {
+          setProxyStore(
+            "recent",
+            [proxyID, ...proxyStore.recent.filter((x) => x !== proxyID)].slice(0, 10),
+          )
+          save()
+          const result = await sdk.client.session.update({ sessionID, proxyID })
+          if (result.error) {
+            toast.show({ message: "Failed to update session proxy", variant: "error" })
+            return
+          }
+          await sync.session.refresh()
+        },
+      }
+    }
+
+    const proxy = createProxy()
+
     const mcp = {
       isEnabled(name: string) {
         const status = sync.data.mcp[name]
@@ -534,6 +604,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       model,
       agent,
       mcp,
+      proxy,
       session,
       permission,
     }

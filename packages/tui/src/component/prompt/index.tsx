@@ -35,6 +35,7 @@ import { computePromptTraits } from "../../prompt/traits"
 import { expandPastedTextPlaceholders, expandTrackedPastedText } from "../../prompt/part"
 import { usePromptStash } from "../../prompt/stash"
 import { DialogStash } from "../dialog-stash"
+import { proxyLabel as ProxyDialogLabel } from "../dialog-proxy"
 import { type AutocompleteRef, Autocomplete } from "./autocomplete"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import type { AssistantMessage, FilePart, UserMessage } from "@opencode-ai/sdk/v2"
@@ -211,6 +212,16 @@ export function Prompt(props: PromptProps) {
   const move = usePromptMove({ projectID: project.project, sessionID: () => props.sessionID })
   const [cursorVersion, setCursorVersion] = createSignal(0)
   const currentProviderLabel = createMemo(() => local.model.parsed().provider)
+  const proxyLabel = createMemo(() => {
+    const id = local.proxy.current(props.sessionID)
+    const label = ProxyDialogLabel(sync.data.config.proxy, id)
+    // Explicit direct is a choice for no proxy. An unset choice falls back to
+    // the config default, so surface its effective label — otherwise a
+    // session routing via the default proxy would look Direct.
+    if (id === "direct") return undefined
+    if (!id && label === "Direct") return undefined
+    return label
+  })
   const hasRightContent = createMemo(() => Boolean(props.right))
 
   function promptModelWarning() {
@@ -1462,6 +1473,10 @@ export function Prompt(props: PromptProps) {
                             {local.model.parsed().model}
                           </text>
                           <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{currentProviderLabel()}</text>
+                          <Show when={proxyLabel()}>
+                            <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>
+                            <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>{proxyLabel()}</text>
+                          </Show>
                           <Show when={showVariant()}>
                             <text fg={fadeColor(theme.textMuted, variantMetaAlpha())}>·</text>
                             <text>

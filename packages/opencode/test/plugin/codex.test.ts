@@ -1,14 +1,17 @@
-import { describe, expect, test } from "bun:test"
+import { beforeEach, describe, expect, test } from "bun:test"
 import { createServer, type IncomingMessage } from "node:http"
 import { type AddressInfo } from "node:net"
 import { WebSocketServer } from "ws"
 import {
   CodexAuthPlugin,
+  lastSeenProxyID,
   parseJwtClaims,
   extractAccountIdFromClaims,
   extractAccountId,
   extractResidency,
   renderOAuthError,
+  resetProxyConfigCache,
+  resolveSessionProxy,
   type IdTokenClaims,
 } from "../../src/plugin/openai/codex"
 
@@ -283,6 +286,64 @@ describe("plugin.codex", () => {
     await hooks.dispose?.()
   })
 
+  test("evicts pooled websockets only when the session proxy changes", async () => {
+    let connections = 0
+    const http = createServer()
+    const wss = new WebSocketServer({ server: http })
+    wss.on("connection", (socket) => {
+      connections += 1
+      // `on`, not `once`: pooled sockets serve several sequential requests.
+      socket.on("message", () => {
+        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp" } }))
+      })
+    })
+    await new Promise<void>((resolve, reject) => {
+      http.once("error", reject)
+      http.listen(0, "127.0.0.1", resolve)
+    })
+    const address = http.address() as AddressInfo
+    const url = `http://127.0.0.1:${address.port}/backend-api/codex/responses`
+    try {
+      const hooks = await CodexAuthPlugin({} as never, {
+        codexApiEndpoint: url,
+        experimentalWebSockets: true,
+      })
+      const loaded = await hooks.auth!.loader!(
+        async () => ({ type: "oauth", refresh: "r", access: "a", expires: Date.now() + 60_000 }) as never,
+        {} as never,
+      )
+      const post = () =>
+        loaded.fetch!(url, {
+          method: "POST",
+          headers: { "session-id": "session-1" },
+          body: JSON.stringify({ stream: true, input: "hi" }),
+        })
+      const updated = (proxyID: string | undefined) =>
+        hooks.event!({
+          event: { type: "session.updated", properties: { info: { id: "session-1", proxyID } } },
+        } as never)
+
+      expect(await (await post()).text()).toContain("data: [DONE]")
+      expect(connections).toBe(1)
+      // Routine updates with an unchanged choice preserve the pooled socket…
+      await updated(undefined)
+      expect(await (await post()).text()).toContain("data: [DONE]")
+      expect(connections).toBe(1)
+      await updated(undefined)
+      expect(await (await post()).text()).toContain("data: [DONE]")
+      expect(connections).toBe(1)
+      // …while an actual proxy switch evicts and re-dials.
+      await updated("corp")
+      expect(await (await post()).text()).toContain("data: [DONE]")
+      expect(connections).toBe(2)
+      await hooks.dispose?.()
+    } finally {
+      for (const socket of wss.clients) socket.terminate()
+      wss.close()
+      http.close()
+    }
+  })
+
   test("filters unsupported modes and uses Codex context limits for OAuth GPT models", async () => {
     const hooks = await CodexAuthPlugin({} as never)
     const limit = { context: 1_050_000, input: 922_000, output: 128_000 }
@@ -478,6 +539,176 @@ async function waitFor(predicate: () => boolean) {
     await new Promise((resolve) => setTimeout(resolve, 1))
   }
 }
+
+describe("resolveSessionProxy", () => {
+  // Module caches (last-good table, eviction tracker) leak across tests in
+  // this file — reset before each resolver case for determinism.
+  beforeEach(() => {
+    resetProxyConfigCache()
+    lastSeenProxyID.clear()
+  })
+  const entry = (overrides: Record<string, unknown> = {}) => ({
+    name: "Corp",
+    type: "http",
+    url: "127.0.0.1:8080",
+    ...overrides,
+  })
+  const config = (proxies: Record<string, unknown>) => ({ proxies }) as never
+  const clientFor = (session: unknown, proxy: unknown) =>
+    ({
+      session: { get: async () => ({ data: session }) },
+      config: { get: async () => ({ data: { proxy } }) },
+    }) as never
+
+  test("returns the entry URL with credentials for explicit choices", async () => {
+    process.env.CODEX_PROXY_TEST_PASS = "s3cret"
+    try {
+      const client = clientFor(
+        { proxyID: "corp" },
+        config({ corp: entry({ username: "bot", passwordEnv: "CODEX_PROXY_TEST_PASS" }) }),
+      )
+      const url = await resolveSessionProxy(client as never, "session-1", "wss://example.com/backend-api/x")
+      expect(url).toBe("http://bot:s3cret@127.0.0.1:8080/")
+    } finally {
+      delete process.env.CODEX_PROXY_TEST_PASS
+    }
+  })
+
+  test("returns undefined for direct resolutions", async () => {
+    const client = clientFor({ proxyID: "direct" }, config({}))
+    expect(await resolveSessionProxy(client as never, "session-1", "wss://example.com/x")).toBeUndefined()
+  })
+
+  test("falls back to config default when the session is gone", async () => {
+    const failing = {
+      session: {
+        get: async () => {
+          throw new Error("gone")
+        },
+      },
+      config: {
+        get: async () => ({ data: { proxy: { default: "corp", proxies: { corp: entry() } } } }),
+      },
+    } as never
+    // Session read fails → proxyID undefined → config default "corp" wins.
+    expect(await resolveSessionProxy(failing as never, "missing", "wss://example.com/x")).toBe(
+      "http://127.0.0.1:8080/",
+    )
+  })
+
+  test("honors per-host noProxy rules against the real target", async () => {
+    const bypassed = {
+      session: {
+        get: async () => {
+          throw new Error("gone")
+        },
+      },
+      config: {
+        get: async () => ({
+          data: { proxy: { default: "corp", proxies: { corp: entry({ noProxy: ["example.com"] }) } } },
+        }),
+      },
+    } as never
+    expect(await resolveSessionProxy(bypassed as never, "missing", "wss://example.com/x")).toBeUndefined()
+  })
+
+  test("throws on unknown proxy ids instead of going direct", async () => {
+    const client = clientFor({ proxyID: "nope" }, config({}))
+    await expect(resolveSessionProxy(client as never, "session-1", "wss://example.com/x")).rejects.toThrow(
+      "Unknown proxy: nope",
+    )
+  })
+
+  test("fails loud on config read failures with nothing cached", async () => {
+    // An unreadable config with no prior good read means the default is
+    // unknowable: swallowing it would silently bypass a required proxy in
+    // favor of env/direct.
+    resetProxyConfigCache()
+    lastSeenProxyID.clear()
+    const client = {
+      session: { get: async () => ({ data: {} }) },
+      config: {
+        get: async () => {
+          throw new Error("config store unavailable")
+        },
+      },
+    } as never
+    await expect(resolveSessionProxy(client, undefined, "wss://example.com/x")).rejects.toThrow(
+      "Proxy config unavailable",
+    )
+  })
+
+  test("degrades to the last good table during a transient config outage", async () => {
+    resetProxyConfigCache()
+    lastSeenProxyID.clear()
+    const table = { default: "corp", proxies: { corp: entry() } }
+    const good = {
+      session: { get: async () => ({ data: {} }) },
+      config: { get: async () => ({ data: { proxy: table } }) },
+    } as never
+    expect(await resolveSessionProxy(good, undefined, "wss://example.com/x")).toBe("http://127.0.0.1:8080/")
+    const blip = {
+      session: { get: async () => ({ data: {} }) },
+      config: {
+        get: async () => {
+          throw new Error("config store unavailable")
+        },
+      },
+    } as never
+    expect(await resolveSessionProxy(blip, undefined, "wss://example.com/x")).toBe("http://127.0.0.1:8080/")
+  })
+
+  test("seeds the eviction tracker from the resolving read", async () => {
+    resetProxyConfigCache()
+    lastSeenProxyID.clear()
+    const client = clientFor({ proxyID: "corp" }, config({ corp: entry() }))
+    expect(await resolveSessionProxy(client as never, "session-9", "wss://example.com/x")).toBe(
+      "http://127.0.0.1:8080/",
+    )
+    // The dial-time read seeded the tracker: an update carrying the same
+    // choice must not evict, and a pre-tracker switch still would.
+    expect(lastSeenProxyID.get("session-9")).toBe("corp")
+  })
+
+  test("propagates config read failures instead of misreporting unknown proxy", async () => {
+    resetProxyConfigCache()
+    lastSeenProxyID.clear()
+    const client = {
+      session: { get: async () => ({ data: { proxyID: "corp" } }) },
+      config: {
+        get: async () => {
+          throw new Error("config store unavailable")
+        },
+      },
+    } as never
+    // Swallowing this would pair proxyID "corp" with an empty table and throw
+    // a misleading UnknownProxyError; surfacing the real failure matches the
+    // session LLM path, which also fails when config is unreadable. (Cached
+    // tables are reset above so the failure is genuinely first-run.)
+    await expect(resolveSessionProxy(client, "session-1", "wss://example.com/x")).rejects.toThrow(
+      "Proxy config unavailable",
+    )
+  })
+
+  test("accepts URL/Request targets and uppercase WS schemes", async () => {
+    const client = clientFor({ proxyID: "corp" }, config({ corp: entry() }))
+    const request = new Request("https://other.example/y", { method: "POST" })
+    expect(await resolveSessionProxy(client as never, "session-1", new URL("WSS://example.com/x"))).toBe(
+      "http://127.0.0.1:8080/",
+    )
+    expect(await resolveSessionProxy(client as never, "session-1", request)).toBe("http://127.0.0.1:8080/")
+  })
+
+  test("extracts URLs from cross-realm-like objects without instanceof", async () => {
+    const client = clientFor({ proxyID: "corp" }, config({ corp: entry() }))
+    // A cross-realm URL fails `instanceof URL` and has no `.url`: duck-typing
+    // on `.href` must still resolve the real target.
+    const foreign = { href: "wss://example.com/x", toString: () => "wss://example.com/x" }
+    expect(await resolveSessionProxy(client as never, "session-1", foreign as unknown as URL)).toBe(
+      "http://127.0.0.1:8080/",
+    )
+  })
+})
 
 async function createCodexWebSocketServer() {
   let headers: IncomingMessage["headers"] | undefined

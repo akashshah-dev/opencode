@@ -27,6 +27,7 @@ import { isRecord } from "@/util/record"
 import { optional } from "@opencode-ai/core/schema"
 import { ProxyFetch } from "@/proxy/fetch"
 import { ProviderTransform } from "./transform"
+import { SnowflakeTransform } from "./snowflake-transform"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ModelStatus } from "./model-status"
@@ -944,56 +945,8 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         oauthToken !== undefined && envToken === undefined && apiKeyToken === undefined && configToken === undefined
       if (!useOAuthHandler) {
         options.fetch = async (url: RequestInfo | URL, init?: RequestInit) => {
-          if (init?.body && typeof init.body === "string") {
-            try {
-              const body = JSON.parse(init.body)
-              if ("max_tokens" in body) {
-                body.max_completion_tokens = body.max_tokens
-                delete body.max_tokens
-                init = { ...init, body: JSON.stringify(body) }
-              }
-            } catch {}
-          }
-
-          const response = await fetch(url, init)
-
-          if (!response.ok && response.status === 400) {
-            try {
-              const errorData = await response.clone().json()
-              const errorMessage = String(errorData.message || errorData.error || "")
-              if (errorMessage.toLowerCase().includes("conversation complete")) {
-                return new Response(
-                  JSON.stringify({
-                    choices: [{ finish_reason: "stop", message: { content: "", role: "assistant" } }],
-                  }),
-                  { status: 200, headers: new Headers({ "content-type": "application/json" }) },
-                )
-              }
-            } catch {}
-          }
-
-          if (response.body && response.headers.get("content-type")?.includes("text/event-stream")) {
-            const reader = response.body.getReader()
-            const encoder = new TextEncoder()
-            const decoder = new TextDecoder()
-            const stream = new ReadableStream({
-              async pull(ctrl) {
-                const { done, value } = await reader.read()
-                if (done) {
-                  ctrl.close()
-                  return
-                }
-                const text = decoder.decode(value, { stream: true })
-                ctrl.enqueue(encoder.encode(text.replace(/"role"\s*:\s*""/g, '"role":"assistant"')))
-              },
-              cancel() {
-                reader.cancel()
-              },
-            })
-            return new Response(stream, { headers: response.headers, status: response.status })
-          }
-
-          return response
+          const response = await fetch(url, { ...init, body: SnowflakeTransform.transformRequestBody(init?.body) })
+          return SnowflakeTransform.normalizeResponse(response)
         }
       }
 
@@ -1831,15 +1784,32 @@ const layer = Layer.effect(
 
           // Per-session proxy routing. Direct resolutions fall through to the
           // existing fetch path unchanged; routed requests use a pooled
-          // dispatcher. Provider-specific fetch transforms (e.g. snowflake)
-          // are bypassed while a session proxy routes the request.
-          const proxied = ProxyFetch.fetch(s.proxyPool, proxy, input, opts)
-          const res = await (proxied ??
-            (customFetch ?? fetch)(input, {
-              ...opts,
-              // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
-              timeout: false,
-            })).finally(() => headerTimeoutCtl?.clear())
+          // dispatcher. Custom provider fetches are bypassed on the proxied
+          // path (OAuth refresh, per-provider transforms), so any wire-format
+          // transform a custom fetch would have applied must be composed here
+          // or the provider rejects the request. Gate on providerID alone:
+          // Snowflake's non-OAuth custom fetch always transforms, AND its
+          // OAuth plugin fetch always transforms too (same shared module), so
+          // both token kinds need it on the proxied path. Custom
+          // Snowflake-compatible endpoints under other ids bypass both custom
+          // fetches on both paths — they never needed the transform and still
+          // don't get it either way.
+          const snowflake = model.providerID === "snowflake-cortex"
+          const proxied = ProxyFetch.fetch(
+            s.proxyPool,
+            proxy,
+            input,
+            snowflake ? { ...opts, body: SnowflakeTransform.transformRequestBody(opts?.body) } : opts,
+          )
+          const dispatched =
+            proxied != null
+              ? proxied.then((response) => (snowflake ? SnowflakeTransform.normalizeResponse(response) : response))
+              : (customFetch ?? fetch)(input, {
+                  ...opts,
+                  // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
+                  timeout: false,
+                })
+          const res = await dispatched.finally(() => headerTimeoutCtl?.clear())
 
           if (!chunkAbortCtl) return res
           return wrapSSE(res, chunkTimeout, chunkAbortCtl)

@@ -42,6 +42,7 @@ import { PermissionProvider } from "./context/permission"
 import { DialogModel } from "./component/dialog-model"
 import { useConnected } from "./component/use-connected"
 import { DialogMcp } from "./component/dialog-mcp"
+import { DialogProxy } from "./component/dialog-proxy"
 import { DialogStatus } from "./component/dialog-status"
 import { DialogDebug } from "./component/dialog-debug"
 import { DialogThemeList } from "./component/dialog-theme-list"
@@ -692,6 +693,21 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         slashName: "mcps",
         run: () => {
           dialog.replace(() => <DialogMcp />)
+        },
+      },
+      {
+        name: "proxy.list",
+        title: "Switch proxy",
+        category: "Agent",
+        slashName: "proxies",
+        slashAliases: ["proxy"],
+        run: () => {
+          const sessionID = route.data.type === "session" ? route.data.sessionID : undefined
+          if (!sessionID) {
+            toast.show({ message: "Open a session to switch its proxy", variant: "warning" })
+            return
+          }
+          dialog.replace(() => <DialogProxy sessionID={sessionID} />)
         },
       },
       {

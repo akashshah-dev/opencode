@@ -143,6 +143,41 @@ describe("Config", () => {
     }),
   )
 
+  it.effect("migrates v1 proxy configuration", () =>
+    Effect.sync(() => {
+      expect(
+        ConfigMigrateV1.migrate({
+          proxy: {
+            default: "corp",
+            proxies: {
+              corp: {
+                name: "Corp",
+                type: "http",
+                url: "proxy.corp:8080",
+                username: "bot",
+                passwordEnv: "PROXY_PASS",
+                noProxy: ["internal.corp"],
+              },
+            },
+          },
+        }).proxy,
+      ).toEqual({
+        default: "corp",
+        proxies: {
+          corp: {
+            name: "Corp",
+            type: "http",
+            url: "proxy.corp:8080",
+            username: "bot",
+            passwordEnv: "PROXY_PASS",
+            noProxy: ["internal.corp"],
+          },
+        },
+      })
+      expect(ConfigMigrateV1.migrate({}).proxy).toBeUndefined()
+    }),
+  )
+
   it.live("returns an empty configuration when directory files do not exist", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),

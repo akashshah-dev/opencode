@@ -1825,6 +1825,32 @@ export type ProviderConfig = {
   }
 }
 
+export type ProxyConfig = {
+  /**
+   * Display name shown in the proxy picker
+   */
+  name: string
+  enabled?: boolean
+  /**
+   * Proxy protocol. Use socks5h for remote DNS resolution through the proxy.
+   */
+  type: "http" | "https" | "socks4" | "socks5" | "socks5h"
+  /**
+   * Proxy address as host:port or full URL. Must not embed credentials, use username/passwordEnv instead.
+   */
+  url: string
+  username?: string
+  passwordEnv?: string
+  noProxy?: Array<string>
+}
+
+export type ProxiesConfig = {
+  default?: string
+  proxies?: {
+    [key: string]: ProxyConfig
+  }
+}
+
 export type McpLocalConfig = {
   /**
    * Type of MCP server connection
@@ -1955,6 +1981,7 @@ export type Config = {
   provider?: {
     [key: string]: ProviderConfig
   }
+  proxy?: ProxiesConfig
   mcp?: {
     [key: string]:
       | McpLocalConfig

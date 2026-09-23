@@ -1,0 +1,21 @@
+{
+  "proxy": {
+    "default": "corp",
+    "proxies": {
+      "corp": {
+        "name": "Corp",
+        "type": "http",
+        "url": "proxy.corp:8080",
+        "username": "bot",
+        "passwordEnv": "PROXY_PASS",
+        "noProxy": ["internal.corp"],
+      },
+      "socks": {
+        "name": "Tunnel",
+        "enabled": false,
+        "type": "socks5h",
+        "url": "socks5h://127.0.0.2:1080",
+      },
+    },
+  },
+}

@@ -68,6 +68,32 @@ export function migrate(info: typeof ConfigV1.Info.Type) {
     ),
     experimental: info.experimental?.policies && { policies: info.experimental.policies },
     providers: providers(info.provider),
+    proxy: proxy(info.proxy),
+  }
+}
+
+function proxy(info: typeof ConfigV1.Info.Type["proxy"]) {
+  if (!info) return undefined
+  return {
+    ...(info.default === undefined ? {} : { default: info.default }),
+    ...(info.proxies === undefined
+      ? {}
+      : {
+          proxies: Object.fromEntries(
+            Object.entries(info.proxies).map(([id, entry]) => [
+              id,
+              {
+                name: entry.name,
+                ...(entry.enabled === undefined ? {} : { enabled: entry.enabled }),
+                type: entry.type,
+                url: entry.url,
+                ...(entry.username === undefined ? {} : { username: entry.username }),
+                ...(entry.passwordEnv === undefined ? {} : { passwordEnv: entry.passwordEnv }),
+                ...(entry.noProxy === undefined ? {} : { noProxy: [...entry.noProxy] }),
+              },
+            ]),
+          ),
+        }),
   }
 }
 

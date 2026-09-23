@@ -14,6 +14,7 @@ import { ConfigMCPV1 } from "./mcp"
 import { ConfigPermissionV1 } from "./permission"
 import { ConfigPluginV1 } from "./plugin"
 import { ConfigProviderV1 } from "./provider"
+import { ConfigProxyV1 } from "./proxy"
 import { ConfigServerV1 } from "./server"
 import { ConfigSkillsV1 } from "./skills"
 
@@ -109,6 +110,9 @@ export const Info = Schema.Struct({
   ).annotate({ description: "Agent configuration, see https://opencode.ai/docs/agents" }),
   provider: Schema.optional(Schema.Record(Schema.String, ConfigProviderV1.Info)).annotate({
     description: "Custom provider configurations and model overrides",
+  }),
+  proxy: Schema.optional(ConfigProxyV1.Info).annotate({
+    description: "Proxy configurations for outbound network requests, see https://opencode.ai/docs/network",
   }),
   mcp: Schema.optional(
     Schema.Record(Schema.String, Schema.Union([ConfigMCPV1.Info, Schema.Struct({ enabled: Schema.Boolean })])),

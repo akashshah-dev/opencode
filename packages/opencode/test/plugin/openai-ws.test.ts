@@ -33,18 +33,38 @@ describe("plugin.openai.ws", () => {
     socket.terminate()
   })
 
-  test("splits proxy credentials into Proxy-Authorization headers", () => {
-    // Bun's WebSocket ignores the `proxy` connect option, so the session
-    // proxy is forwarded as explicit headers + endpoint instead.
-    expect(OpenAIWebSocket.connectWithProxyAuth({}, undefined)).toEqual({ headers: {} })
-    expect(OpenAIWebSocket.connectWithProxyAuth({ a: "b" }, "http://127.0.0.1:8080/")).toEqual({
-      headers: { a: "b" },
-      proxy: "http://127.0.0.1:8080/",
-    })
-    expect(OpenAIWebSocket.connectWithProxyAuth({}, "http://user:pass@127.0.0.1:8080/")).toEqual({
-      headers: { "proxy-authorization": `Basic ${Buffer.from("user:pass").toString("base64")}` },
-      proxy: "http://127.0.0.1:8080/",
-    })
+  test("rejects explicit SOCKS proxies instead of silently bypassing them", async () => {
+    for (const proxy of ["socks5://127.0.0.1:1080", "SOCKS5H://127.0.0.1:1080", "  socks4://127.0.0.1:1080  "]) {
+      const error = await OpenAIWebSocket.connectResponsesWebSocket({
+        url: "wss://example.com/v1/responses",
+        headers: {},
+        proxy,
+      }).then(
+        () => {
+          throw new Error(`Expected rejection for ${proxy}`)
+        },
+        (error: unknown) => error,
+      )
+      expect(OpenAIWebSocket.isProxyUnsupportedError(error)).toBe(true)
+      expect((error as Error).message).toContain("SOCKS")
+    }
+  })
+
+  test("redacts credentials in proxy labels and unsupported errors", () => {
+    expect(OpenAIWebSocket.redactProxyLabel("http://bot:s3cret@127.0.0.1:8080/")).toBe(
+      "http://bot:***@127.0.0.1:8080/",
+    )
+    expect(OpenAIWebSocket.redactProxyLabel("http://127.0.0.1:8080/")).toBe("http://127.0.0.1:8080/")
+    expect(OpenAIWebSocket.redactProxyLabel("http://bot:s3 cret@127.0.0.1:8080/")).toBe(
+      "http://bot:***@127.0.0.1:8080/",
+    )
+    const error = new OpenAIWebSocket.ProxyUnsupportedError("socks5://bot:s3cret@127.0.0.1:1080")
+    expect(error.message).toContain("socks5://bot:***@127.0.0.1:1080")
+    expect(error.message).not.toContain("s3cret")
+    // The raw URL must not linger on the thrown object where serializers or
+    // telemetry could capture it.
+    expect(error.proxy).toBe("socks5://bot:***@127.0.0.1:1080")
+    expect(JSON.stringify(error)).not.toContain("s3cret")
   })
 
   test("enforces websocket connect timeout", async () => {

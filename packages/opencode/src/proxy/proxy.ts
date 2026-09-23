@@ -124,8 +124,12 @@ export function redactProxyUrl(url: string) {
     if (parsed.password) parsed.password = "***"
     return parsed.toString()
   }
-  return url.replace(/^(.*:\/\/)?([^/\s@]+)@/u, (_, scheme: string | undefined, user: string) => {
-    return `${scheme ?? ""}${user.split(":")[0]}@`
+  // Greedy to the LAST `@`: passwords may contain `/`, whitespace, or `@`
+  // themselves — see redactProxyLabel in plugin/openai/ws.ts. Over-redacting
+  // an already-invalid string is safe; under-redacting leaks.
+  return url.replace(/^(.*:\/\/)?([\s\S]+)@/u, (_, scheme: string | undefined, user: string) => {
+    const masked = user.includes(":") ? ":***" : ""
+    return `${scheme ?? ""}${user.split(":")[0]}${masked}@`
   })
 }
 

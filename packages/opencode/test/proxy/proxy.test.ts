@@ -130,6 +130,11 @@ describe("redactProxyUrl", () => {
   test("leaves credential-less urls intact", () => {
     expect(Proxy.redactProxyUrl("http://proxy.corp:8080/")).toBe("http://proxy.corp:8080/")
   })
+
+  test("keeps the mask marker on unparseable urls with passwords", () => {
+    expect(Proxy.redactProxyUrl("http://bot:s3 cret@proxy.corp:8080/")).toBe("http://bot:***@proxy.corp:8080/")
+    expect(Proxy.redactProxyUrl("http://bot@proxy.corp:8080/")).toBe("http://bot@proxy.corp:8080/")
+  })
 })
 
 describe("validateID", () => {
